@@ -1,7 +1,18 @@
-FROM continuumio/miniconda3
+# Ubuntu base + Miniconda (Python 3.8). Avoids Debian Buster issues.
+# Build with: docker build -t ttct_img -f docker/dockerfile .
 
-# install python 3.8.5
-RUN conda install python=3.8.5
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/root/miniconda3/bin:$PATH"
+
+# Install Miniconda with Python 3.8 via direct download
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget ca-certificates \
+    && wget -q https://repo.anaconda.com/miniconda/Miniconda3-py38_4.12.0-Linux-x86_64.sh -O /tmp/miniconda.sh \
+    && bash /tmp/miniconda.sh -b -p /root/miniconda3 \
+    && rm /tmp/miniconda.sh \
+    && apt-get purge -y wget && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 RUN echo '\
    Acquire::Retries "100";\
@@ -13,15 +24,14 @@ RUN echo '\
    Debug::Acquire::https "true";\
    ' > /etc/apt/apt.conf.d/99custom
 
-# install mujoco
+# install mujoco (wget needed here; was removed after miniconda install)
 RUN apt-get update
-RUN apt-get install build-essential --yes
+RUN apt-get install -y build-essential wget unzip git
 RUN cd /root \
     && mkdir .mujoco \
     && wget https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz \
     && tar -xf mujoco210-linux-x86_64.tar.gz -C .mujoco \
     && export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/root/.mujoco/mujoco210/bin
-
 
 # install mujoco_py
 RUN apt-get install -y \
@@ -64,8 +74,6 @@ RUN pip install numpy==1.23.4
 
 RUN pip install loguru num2words transformers tensorboardX loralib safepo safety_gymnasium
 
-
-
 # mb rce deps
 #RUN apt-get install libopenmpi-dev
 #ADD requirements.txt /tmp/
@@ -74,10 +82,10 @@ RUN pip install loguru num2words transformers tensorboardX loralib safepo safety
 #RUN pip install pip install scikit-learn
 #RUN echo "cd /usr/home/workspace/bullet_safety_gym_env && pip install -e ." >> ~/.bashrc
 
+# Setup .bashrc for automatic setup
+RUN echo "export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/root/.mujoco/mujoco210/bin" >> ~/.bashrc
 RUN echo "cd /usr/home/workspace/ttct && pip install -e ." >> ~/.bashrc
 RUN echo "cd /usr/home/workspace/ && pip install -e ." >> ~/.bashrc
-
-
 RUN echo "cd /usr/home/workspace" >> ~/.bashrc
 
 #ADD requirements.txt /tmp/
