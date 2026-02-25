@@ -1,0 +1,90 @@
+FROM continuumio/miniconda3
+
+# install python 3.8.5
+RUN conda install python=3.8.5
+
+RUN echo '\
+   Acquire::Retries "100";\
+   Acquire::https::Timeout "240";\
+   Acquire::http::Timeout "240";\
+   APT::Get::Assume-Yes "true";\
+   APT::Install-Recommends "false";\
+   APT::Install-Suggests "false";\
+   Debug::Acquire::https "true";\
+   ' > /etc/apt/apt.conf.d/99custom
+
+# install mujoco
+RUN apt-get update
+RUN apt-get install build-essential --yes
+RUN cd /root \
+    && mkdir .mujoco \
+    && wget https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz \
+    && tar -xf mujoco210-linux-x86_64.tar.gz -C .mujoco \
+    && export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/root/.mujoco/mujoco210/bin
+
+
+# install mujoco_py
+RUN apt-get install -y \
+    libosmesa6-dev \
+    patchelf
+    #libgl1-mesa-dev \
+    #libgl1-mesa-glx \
+    #libglew-dev \
+    #libosmesa6-dev \
+    #software-properties-common \
+    #patchelf
+RUN pip install onnxruntime free-mujoco-py
+
+# install torch with cuda support
+RUN pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu113 \
+    && pip install tensorflow \
+    && pip install wandb moviepy opencv-python
+
+# fixed&additional pip deps
+#RUN apt-get install libopenmpi-dev
+#RUN pip install mpi4py
+RUN pip install setuptools==65.5.0 "wheel<0.40.0"
+RUN pip install gym
+RUN pip install gymnasium==0.29.1
+RUN pip install pandas==1.5.3
+RUN pip install matplotlib==3.6.2
+RUN pip install stable_baselines3==2.3.0 --no-deps
+RUN pip install numpy==1.23.4
+RUN pip install imageio-ffmpeg==0.4.9
+RUN pip install scikit-learn==1.3.2
+
+# Install Safety-Gym
+#RUN mkdir -p /usr/home/workspace/safety-gym
+#COPY safety-gym /usr/home/workspace/safety-gym
+#RUN cd /usr/home/workspace/safety-gym \
+#    && pip install -e .
+
+# fix after safety gym installation
+RUN pip install numpy==1.23.4
+
+RUN pip install loguru num2words transformers tensorboardX loralib safepo safety_gymnasium
+
+
+
+# mb rce deps
+#RUN apt-get install libopenmpi-dev
+#ADD requirements.txt /tmp/
+#RUN pip install -r /tmp/requirements.txt
+#RUN pip install lightgbm
+#RUN pip install pip install scikit-learn
+#RUN echo "cd /usr/home/workspace/bullet_safety_gym_env && pip install -e ." >> ~/.bashrc
+
+RUN echo "cd /usr/home/workspace/ttct && pip install -e ." >> ~/.bashrc
+RUN echo "cd /usr/home/workspace/ && pip install -e ." >> ~/.bashrc
+
+
+RUN echo "cd /usr/home/workspace" >> ~/.bashrc
+
+#ADD requirements.txt /tmp/
+#RUN pip install -r /tmp/requirements.txt
+
+WORKDIR /usr/home/workspace
+
+# install safety gym
+#CMD cd /usr/home/workspace/safety-gym && pip install -e .
+#RUN echo "cd /usr/home/workspace/exps/ites" >> ~/.bashrc

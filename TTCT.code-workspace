@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"name": "SSH FS - ml_4",
+			"uri": "ssh://ml_4/home/ggorbov"
+		},
+		{
+			"name": "SSH FS - ml_3",
+			"uri": "ssh://ml_3/home/ggorbov"
+		}
+	],
+	"settings": {}
+}
