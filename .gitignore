@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+*.egg
+
+# Egg-info папки (автоматически генерируются при установке)
+TTCT.egg-info/
+safepo.egg-info/
+ttct.egg-info/
+
+# Результаты обучения (модели, логи, чекпоинты)
+ttct/result/
+ttct/results/
+result/
+results/
+*.pt
+*.pth
+*.ckpt
+
+# Датасеты (если большие)
+ttct/dataset/*.pkl
+dataset/*.pkl
+
+# TensorBoard логи
+*.tfevents.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Временные файлы
+*.tmp
+*.log
+*.cache
+
+# Comet ML
+.comet.config
+
+# Jupyter
+.ipynb_checkpoints/
