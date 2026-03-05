@@ -42,7 +42,7 @@ from common.logger import EpochLogger
 from common.model import ActorVCriticTrajectory
 from utils.config import single_agent_args, isaac_gym_map
 from utils.util import BufferDataset
-from utils.async_vector_env import AsyncVectorEnv
+from utils.async_vector_env import AsyncVectorEnv, CostInInfoWrapper
 import gym_minigrid
 import safety_gymnasium
 
@@ -221,12 +221,22 @@ def main(args, cfg_env=None):
         EncodeModel.train()
     
     if args.task == "MiniGrid":
-        envB=[lambda: gym.make('MiniGrid-HazardWorld-B-v0') for _ in range(args.num_envs//3)]
-        envS=[lambda: gym.make('MiniGrid-HazardWorld-S-v0') for _ in range(args.num_envs//3)]
-        envL=[lambda: gym.make('MiniGrid-HazardWorld-L-v0') for _ in range(args.num_envs-(args.num_envs//3)*2)]
+        def _make_minigrid(name):
+            try:
+                # Newer gym versions: disable_env_checker to allow 6-element step from env
+                return gym.make(name, disable_env_checker=True)
+            except TypeError:
+                # Older gym versions without disable_env_checker
+                return gym.make(name)
+
+        def _wrap_minigrid(name):
+            return CostInInfoWrapper(_make_minigrid(name))
+        envB=[lambda: _wrap_minigrid('MiniGrid-HazardWorld-B-v0') for _ in range(args.num_envs//3)]
+        envS=[lambda: _wrap_minigrid('MiniGrid-HazardWorld-S-v0') for _ in range(args.num_envs//3)]
+        envL=[lambda: _wrap_minigrid('MiniGrid-HazardWorld-L-v0') for _ in range(args.num_envs-(args.num_envs//3)*2)]
         allenv=envB+envS+envL
         if args.is_lava:
-            allenv=[lambda: gym.make('MiniGrid-HazardWorld-LavaWall-v0') for _ in range(args.num_envs)]
+            allenv=[lambda: _wrap_minigrid('MiniGrid-HazardWorld-LavaWall-v0') for _ in range(args.num_envs)]
         env = AsyncVectorEnv(allenv)   
     elif args.task == "SafetyRacecarGoal2-v0":
         configB={"env_type":'budgetary','agent_name':'Racecar'}
@@ -242,6 +252,9 @@ def main(args, cfg_env=None):
     obs_space = torch.zeros((embed_dim+embed_dim+obs_dim,))
     if args.task != "MiniGrid":
         config["steps_per_epoch"]=config["steps_per_epoch"]//4
+    # allow overriding batch size from CLI
+    if hasattr(args, "batch_size") and args.batch_size is not None:
+        config["batch_size"] = args.batch_size
     # set training steps
     steps_per_epoch = config.get("steps_per_epoch", args.steps_per_epoch)
     total_steps = config.get("total_steps", args.total_steps)

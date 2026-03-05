@@ -163,7 +163,7 @@ def main(args, cfg_env=None):
                     obs_emb_dim=obs_emb_dim,
                     obs_dim=obs_dim,
                     threshold=config['threshold_Mini'] if args.task == "MiniGrid" else config['threshold_Goal'],
-                    cost_value=config['cost_value']
+                    episodic_cost_value=config['cost_value']
                 )
             load_from_save(EncodeModel,TL_loadpath)
             EncodeModel=EncodeModel.to(device)

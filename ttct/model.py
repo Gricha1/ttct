@@ -183,8 +183,25 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = attn_mask
 
     def attention(self, x: torch.Tensor):
-        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        if self.attn_mask is None:
+            return self.attn(x, x, x, need_weights=False)[0]
+        L, N, E = x.shape
+        attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device)
+        mask = attn_mask[:L, :L]
+        nhead = self.attn.num_heads
+        head_dim = E // nhead
+        qkv = F.linear(x, self.attn.in_proj_weight, self.attn.in_proj_bias)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(L, N, nhead, head_dim).transpose(0, 1).transpose(1, 2)
+        k = k.view(L, N, nhead, head_dim).transpose(0, 1).transpose(1, 2)
+        v = v.view(L, N, nhead, head_dim).transpose(0, 1).transpose(1, 2)
+        scale = head_dim ** -0.5
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        scores = scores + mask.unsqueeze(0).unsqueeze(0)
+        attn_weights = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn_weights, v)
+        out = out.transpose(1, 2).transpose(0, 1).reshape(L, N, E)
+        return F.linear(out, self.attn.out_proj.weight, self.attn.out_proj.bias)
 
     def forward(self, x: torch.Tensor):
         x = x + self.attention(self.ln_1(x))

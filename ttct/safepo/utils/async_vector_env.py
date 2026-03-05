@@ -13,7 +13,43 @@ from gym.vector.utils import (create_shared_memory, create_empty_array,
                               write_to_shared_memory, read_from_shared_memory,
                               concatenate, CloudpickleWrapper, clear_mpi_env_vars)
 
-__all__ = ['AsyncVectorEnv']
+__all__ = ['AsyncVectorEnv', 'CostInInfoWrapper']
+
+
+class CostInInfoWrapper:
+    """Wraps an env that returns (obs, reward, cost, term, trunc, info) so that
+    step() returns (obs, reward, term, trunc, info) with cost in info['cost'].
+    This satisfies gym's 4/5-element step check in worker processes."""
+    def __init__(self, env):
+        self.env = env
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        out = self.env.step(action)
+        if len(out) == 6:
+            obs, reward, cost, term, trunc, info = out
+            info = dict(info) if info is not None else {}
+            info['cost'] = cost
+            return (obs, reward, term, trunc, info)
+        return out
+
+    def close(self):
+        return self.env.close()
+
+
+def _safe_concatenate(observations_list, out, single_observation_space):
+    """Concatenate observations; fallback to np.stack if gym.concatenate fails (e.g. unsupported space type)."""
+    try:
+        concatenate(observations_list, out, single_observation_space)
+    except (ValueError, TypeError):
+        # e.g. "Space of type <class 'tuple'> is not a valid gym.Space" in some gym versions
+        arr = np.stack(observations_list, axis=0)
+        out[:] = arr
 
 
 class AsyncState(Enum):
@@ -137,7 +173,8 @@ class AsyncVectorEnv(VectorEnv):
         _, successes = zip(*[pipe.recv() for pipe in self.parent_pipes])
         self._raise_if_errors(successes)
 
-    def reset_async(self):
+    def reset_async(self, seed=None, options=None):
+        """Accept seed/options for compatibility with newer gym/gymnasium VectorEnv API."""
         self._assert_is_running()
         if self._state != AsyncState.DEFAULT:
             raise AlreadyPendingCallError('Calling `reset_async` while waiting '
@@ -148,13 +185,15 @@ class AsyncVectorEnv(VectorEnv):
             pipe.send(('reset', None))
         self._state = AsyncState.WAITING_RESET
 
-    def reset_wait(self, timeout=None):
+    def reset_wait(self, timeout=None, seed=None, options=None):
         """
         Parameters
         ----------
         timeout : int or float, optional
             Number of seconds before the call to `reset_wait` times out. If
             `None`, the call to `reset_wait` never times out.
+        seed, options : optional
+            Accepted for compatibility with newer gym/gymnasium VectorEnv API.
 
         Returns
         -------
@@ -177,7 +216,7 @@ class AsyncVectorEnv(VectorEnv):
         observations_list, infos= zip(*results)
 
         if not self.shared_memory:
-            concatenate(observations_list, self.observations, self.single_observation_space)
+            _safe_concatenate(observations_list, self.observations, self.single_observation_space)
 
         return (deepcopy(self.observations) if self.copy else self.observations , infos)
 
@@ -271,7 +310,7 @@ class AsyncVectorEnv(VectorEnv):
         observations_list, rewards, costs,terminateds, truncateds, infos= zip(*results)
         
         if not self.shared_memory:
-            concatenate(observations_list, self.observations,
+            _safe_concatenate(observations_list, self.observations,
                 self.single_observation_space)
 
         return (deepcopy(self.observations) if self.copy else self.observations,
@@ -297,7 +336,7 @@ class AsyncVectorEnv(VectorEnv):
                     'call to `{0}` to complete.'.format(self._state.value))
                 function = getattr(self, '{0}_wait'.format(self._state.value))
                 function(timeout)
-        except mp.TimeoutError:
+        except (mp.TimeoutError, EOFError, BrokenPipeError, OSError, AttributeError):
             terminate = True
 
         if terminate:
@@ -305,12 +344,15 @@ class AsyncVectorEnv(VectorEnv):
                 if process.is_alive():
                     process.terminate()
         else:
-            for pipe in self.parent_pipes:
-                if (pipe is not None) and (not pipe.closed):
-                    pipe.send(('close', None))
-            for pipe in self.parent_pipes:
-                if (pipe is not None) and (not pipe.closed):
-                    pipe.recv()
+            try:
+                for pipe in self.parent_pipes:
+                    if (pipe is not None) and (not pipe.closed):
+                        pipe.send(('close', None))
+                for pipe in self.parent_pipes:
+                    if (pipe is not None) and (not pipe.closed):
+                        pipe.recv()
+            except (EOFError, BrokenPipeError, OSError, AttributeError):
+                pass
 
         for pipe in self.parent_pipes:
             if pipe is not None:
@@ -378,7 +420,12 @@ def _worker(index, env_fn, pipe, parent_pipe, shared_memory, error_queue):
                 observation,info = env.reset()
                 pipe.send(((observation,info), True))
             elif command == 'step':
-                observation, reward, cost, terminated, truncated, info= env.step(data)
+                step_out = env.step(data)
+                if len(step_out) == 5:
+                    observation, reward, terminated, truncated, info = step_out
+                    cost = info.get('cost', 0.0) if info else 0.0
+                else:
+                    observation, reward, cost, terminated, truncated, info = step_out
                 if terminated or truncated:
                     old_observation, old_info = deepcopy(observation), deepcopy(info)
                     observation, info = env.reset()

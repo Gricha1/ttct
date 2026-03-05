@@ -121,6 +121,8 @@ class Logger:
         level: int = 1,
         use_tensorboard=True,
         verbose=True,
+        use_comet=False,
+        comet_experiment=None,
     ):
         self.log_dir = log_dir
         self.debug = debug
@@ -146,6 +148,8 @@ class Logger:
         self.torch_saver_elements = None
         self.torch_saver_elements1 = None
         self.use_tensorboard = use_tensorboard
+        self.use_comet = use_comet
+        self.comet_experiment = comet_experiment
         self.logged = True
 
         # Setup tensor board logging if enabled and MPI root process
@@ -155,6 +159,11 @@ class Logger:
     def close(self):
         """Close the output file.
         """
+        if getattr(self, "comet_experiment", None) is not None:
+            try:
+                self.comet_experiment.end()
+            except Exception:
+                pass
         self.output_file.close()
 
     def debug(self, msg, color="yellow"):
@@ -341,6 +350,19 @@ class Logger:
             for key, val in self.log_current_row.items():
                 self.summary_writer.add_scalar(key, val, global_step=self.epoch)
 
+        # Log to Comet ML if enabled
+        if getattr(self, "use_comet", False) and getattr(self, "comet_experiment", None) is not None:
+            try:
+                metrics = {
+                    k: float(v) if hasattr(v, "__float__") else v
+                    for k, v in self.log_current_row.items()
+                    if isinstance(v, (int, float)) or (hasattr(v, "__float__") and not isinstance(v, (str, dict, list)))
+                }
+                if metrics:
+                    self.comet_experiment.log_metrics(metrics, step=self.epoch)
+            except Exception:
+                pass
+
         # free logged information in all processes...
         self.log_current_row.clear()
         self.first_row = False
@@ -357,6 +379,8 @@ class EpochLogger(Logger):
         level: int = 1,
         use_tensorboard=True,
         verbose=True,
+        use_comet=False,
+        comet_experiment=None,
     ):
         super().__init__(
             log_dir=log_dir,
@@ -366,6 +390,8 @@ class EpochLogger(Logger):
             level=level,
             use_tensorboard=use_tensorboard,
             verbose=verbose,
+            use_comet=use_comet,
+            comet_experiment=comet_experiment,
         )
         self.epoch_dict = dict()
 

@@ -39,7 +39,7 @@ import loralib as lora
 import sys
 from common.buffer import VectorizedOnPolicyBuffer
 from common.lagrange import Lagrange
-from common.logger import EpochLogger
+from common.logger import EpochLogger, convert_json
 from common.model import ActorVCriticTrajectory
 from utils.config import single_agent_args, isaac_gym_map
 from utils.util import BufferDataset
@@ -59,14 +59,14 @@ default_cfg = {
 
 isaac_gym_specific_cfg = {
     'total_steps': 100000000,
-    'steps_per_epoch': 32768,
+    'steps_per_epoch': 16384,
     'hidden_sizes': [256, 128, 128, 64],
     'r_gamma': 0.95,
     'c_gamma': 0.95,
     'threshold_Mini':7.55,
     'threshold_Goal':5.5,
     'cost_value':1.0,
-    'batch_size':512,
+    'batch_size':128,
     'target_kl': 0.016,
     'num_mini_batch': 4,
     'learning_rate':3e-4,
@@ -105,8 +105,13 @@ def lora_model(model,rank):
             _set_module(model, submodule_key, lora_layer)
     
 
-def load_from_save(tlmodel,name):
-    model_path = name
+def load_from_save(tlmodel, name):
+    model_path = name.strip() if name else ""
+    if not model_path or not os.path.isfile(model_path):
+        raise FileNotFoundError(
+            f"Чекпоинт TTCT не найден: '{model_path}'. "
+            "Укажите верный TL_LOADPATH (или --TL_loadpath) к файлу checkpoint_*.pt"
+        )
     with open(model_path, 'rb') as opened_file:
         state_dict = torch.load(opened_file, map_location="cpu")
     tlmodel.load_state_dict(state_dict,strict=True)      
@@ -142,6 +147,12 @@ def main(args, cfg_env=None):
         config['threshold_Mini']=5.0
     if language_model=="TLmodel":
         TL_loadpath=args.TL_loadpath
+        if not (TL_loadpath and str(TL_loadpath).strip()):
+            raise FileNotFoundError(
+                "Не задан путь к чекпоинту TTCT (--TL_loadpath). "
+                "Сначала обучите TTCT (train_ttct.sh), затем укажите путь к модели, например: "
+                "export TL_LOADPATH=/path/to/ttct/result/.../model/checkpoint_latest.pt"
+            )
         if args.is_finetune:
             EncodeModel=U3T(
                     embed_dim=embed_dim,
@@ -157,7 +168,7 @@ def main(args, cfg_env=None):
                     obs_emb_dim=obs_emb_dim,
                     obs_dim=obs_dim,
                     threshold=config['threshold_Mini'] if args.task == "MiniGrid" else config['threshold_Goal'],
-                    cost_value=config['cost_value']
+                    episodic_cost_value=config['cost_value']
                 )
             load_from_save(EncodeModel,TL_loadpath)
             EncodeModel=EncodeModel.to(device)
@@ -179,7 +190,7 @@ def main(args, cfg_env=None):
                     obs_emb_dim=obs_emb_dim,
                     obs_dim=obs_dim,
                     threshold=config['threshold_Mini'] if args.task == "MiniGrid" else config['threshold_Goal'],
-                    cost_value=config['cost_value']
+                    episodic_cost_value=config['cost_value']
                 )
         load_from_save(TLmodel,TL_loadpath)
         TLmodel=TLmodel.to(device)
@@ -206,12 +217,17 @@ def main(args, cfg_env=None):
     EncodeModel.train()
     
     if args.task == "MiniGrid":
-        envB=[lambda: gym.make('MiniGrid-HazardWorld-B-v0') for _ in range(args.num_envs//3)]
-        envS=[lambda: gym.make('MiniGrid-HazardWorld-S-v0') for _ in range(args.num_envs//3)]
-        envL=[lambda: gym.make('MiniGrid-HazardWorld-L-v0') for _ in range(args.num_envs-(args.num_envs//3)*2)]
+        def _make_minigrid(name):
+            try:
+                return gym.make(name, disable_env_checker=True)
+            except TypeError:
+                return gym.make(name)
+        envB=[lambda: _make_minigrid('MiniGrid-HazardWorld-B-v0') for _ in range(args.num_envs//3)]
+        envS=[lambda: _make_minigrid('MiniGrid-HazardWorld-S-v0') for _ in range(args.num_envs//3)]
+        envL=[lambda: _make_minigrid('MiniGrid-HazardWorld-L-v0') for _ in range(args.num_envs-(args.num_envs//3)*2)]
         allenv=envB+envS+envL
         if args.is_lava:
-            allenv=[lambda: gym.make('MiniGrid-HazardWorld-LavaWall-v0') for _ in range(args.num_envs)]
+            allenv=[lambda: _make_minigrid('MiniGrid-HazardWorld-LavaWall-v0') for _ in range(args.num_envs)]
         env = AsyncVectorEnv(allenv)   
     elif args.task == "SafetyRacecarGoal2-v0":
         configB={"env_type":'budgetary','agent_name':'Racecar'}
@@ -278,15 +294,37 @@ def main(args, cfg_env=None):
     lagrange = Lagrange(
         cost_limit=args.cost_limit,
         lagrangian_multiplier_init=args.lagrangian_multiplier_init,
+        lagrangian_multiplier_lr=getattr(args, "lagrangian_multiplier_lr", 0.035),
     )
 
     # set up the logger
     dict_args = vars(args)
     dict_args.update(config)
+    use_comet = getattr(args, "use_comet", False)
+    comet_experiment = None
+    if use_comet:
+        try:
+            import comet_ml
+            comet_project = getattr(args, "comet_project_name", "ttct-ppo-lag")
+            comet_workspace = getattr(args, "comet_workspace", None)
+            comet_experiment = comet_ml.Experiment(project_name=comet_project, workspace=comet_workspace)
+            params = dict(convert_json(dict_args))
+            comet_experiment.log_parameters(params)
+            if torch.cuda.is_available():
+                comet_experiment.log_parameter("gpu_name", torch.cuda.get_device_name(0))
+        except Exception:
+            use_comet = False
+            comet_experiment = None
+            import traceback
+            traceback.print_exc()
     logger = EpochLogger(
         log_dir=args.log_dir,
         seed=str(args.seed),
+        use_comet=use_comet,
+        comet_experiment=comet_experiment,
     )
+    if use_comet and comet_experiment is not None:
+        logger.log("Comet ML: experiment started (project=%s)" % getattr(args, "comet_project_name", "ttct-ppo-lag"), color="green")
     rew_deque = deque(maxlen=50)
     train_cost_deque = deque(maxlen=50)
     true_cost_deque = deque(maxlen=50)

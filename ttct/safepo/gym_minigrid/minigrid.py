@@ -909,7 +909,8 @@ class MiniGridEnv(gym.Env):
         """
         Generate random integer in [low,high[
         """
-
+        if hasattr(self.np_random, 'integers'):
+            return int(self.np_random.integers(low, high))
         return self.np_random.randint(low, high)
 
     def _rand_float(self, low, high):
@@ -924,6 +925,8 @@ class MiniGridEnv(gym.Env):
         Generate random boolean value
         """
 
+        if hasattr(self.np_random, 'integers'):
+            return (self.np_random.integers(0, 2) == 0)
         return (self.np_random.randint(0, 2) == 0)
 
     def _rand_elem(self, iterable):
@@ -964,6 +967,11 @@ class MiniGridEnv(gym.Env):
         Generate a random (x,y) position tuple
         """
 
+        if hasattr(self.np_random, 'integers'):
+            return (
+                int(self.np_random.integers(xLow, xHigh)),
+                int(self.np_random.integers(yLow, yHigh))
+            )
         return (
             self.np_random.randint(xLow, xHigh),
             self.np_random.randint(yLow, yHigh)

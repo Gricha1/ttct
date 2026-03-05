@@ -1,6 +1,6 @@
 from typing import Tuple, Union
 from torch import nn
-from ttct.model import Transformer, LayerNorm
+from model import Transformer, LayerNorm
 import torch
 from transformers import BertModel,BertTokenizer
 import numpy as np 
@@ -42,7 +42,9 @@ class TTCT(nn.Module):
             heads=transformer_heads,
             attn_mask=self.build_trajectory_attention_mask()
         )
-        self.text_model = BertModel.from_pretrained(BERT_PATH)
+        # BERT держим на CPU, чтобы не падать по памяти, TTCT (трансформер траекторий) работает на self.device (cuda)
+        self.text_model = BertModel.from_pretrained(BERT_PATH).to(torch.device("cpu"))
+        self.tokenizer = BertTokenizer.from_pretrained(BERT_PATH)
         self.cost_assignment_layer = nn.Sequential(
             nn.Linear(embed_dim*2, embed_dim),
             nn.ReLU(),
@@ -150,8 +152,8 @@ class TTCT(nn.Module):
             encoded_dict=self.tokenizer.encode_plus(sent, add_special_tokens=True, max_length=77, padding='max_length', return_tensors='pt', return_attention_mask=True, return_token_type_ids=False)
             input_ids.append(encoded_dict['input_ids'])
             attention_masks.append(encoded_dict['attention_mask'])
-        input_ids = torch.cat(input_ids, dim=0).to(self.device, non_blocking=True)
-        attention_masks = torch.cat(attention_masks, dim=0).to(self.device, non_blocking=True)
+        input_ids = torch.cat(input_ids, dim=0)
+        attention_masks = torch.cat(attention_masks, dim=0)
         text_features=self.encode_text(input_ids, attention_masks)
         return text_features
     
@@ -204,6 +206,10 @@ class TTCT(nn.Module):
         output_attentions = False
         output_hidden_states = False
         return_dict = True
+        # Приводим входы к тому же девайсу, что и веса BERT
+        model_device = next(self.text_model.parameters()).device
+        input_ids = input_ids.to(model_device)
+        attention_mask = attention_mask.to(model_device)
         text_outputs = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -212,7 +218,8 @@ class TTCT(nn.Module):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        x = text_outputs[1]
+        # CLS-эмбеддинги переносим на self.device (cuda) и проецируем в пространство TTCT
+        x = text_outputs[1].to(self.device)
         text_features = x @ self.text_projection
         return text_features
     
@@ -235,7 +242,7 @@ class TTCT(nn.Module):
         scores = torch.matmul(logit_scale * embed_norm.unsqueeze(1) , text_featrues_norm).squeeze()
         final_cost = scores > self.threshold
         if is_predict_cost:
-            atten_score = F.sigmoid(scores)
+            atten_score = torch.sigmoid(scores).unsqueeze(-1)
             embed_norm = atten_score * embed_norm
             predict_cost = self.regression(embed_norm,text_featrues_norm).squeeze()
             final_cost = torch.where(final_cost == 0, predict_cost, self.episodic_cost_value)
