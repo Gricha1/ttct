@@ -38,7 +38,7 @@ import loralib as lora
 import sys
 from common.buffer import VectorizedOnPolicyBuffer
 from common.lagrange import Lagrange
-from common.logger import EpochLogger
+from common.logger import EpochLogger, convert_json
 from common.model import ActorVCriticTrajectory
 from utils.config import single_agent_args, isaac_gym_map
 from utils.util import BufferDataset
@@ -312,10 +312,31 @@ def main(args, cfg_env=None):
     # set up the logger
     dict_args = vars(args)
     dict_args.update(config)
+    use_comet = getattr(args, "use_comet", False)
+    comet_experiment = None
+    if use_comet:
+        try:
+            import comet_ml
+            comet_project = getattr(args, "comet_project_name", "ttct_training")
+            comet_workspace = getattr(args, "comet_workspace", None)
+            comet_experiment = comet_ml.Experiment(project_name=comet_project, workspace=comet_workspace)
+            params = dict(convert_json(dict_args))
+            comet_experiment.log_parameters(params)
+            if torch.cuda.is_available():
+                comet_experiment.log_parameter("gpu_name", torch.cuda.get_device_name(0))
+        except Exception:
+            use_comet = False
+            comet_experiment = None
+            import traceback
+            traceback.print_exc()
     logger = EpochLogger(
         log_dir=args.log_dir,
         seed=str(args.seed),
+        use_comet=use_comet,
+        comet_experiment=comet_experiment,
     )
+    if use_comet and comet_experiment is not None:
+        logger.log("Comet ML: experiment started (project=%s)" % getattr(args, "comet_project_name", "ttct-training"), color="green")
     rew_deque = deque(maxlen=50)
     train_cost_deque = deque(maxlen=50)
     true_cost_deque = deque(maxlen=50)

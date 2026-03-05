@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Run PPO-Lag with TTCT and LoRA fine-tuning of encoders.
+# Comet ML: включён по умолчанию, проект ttct-training.
 # Usage from ttct/ttct:
 #   export TL_LOADPATH=/path/to/ttct/result/.../model/checkpoint_latest.pt
 #   ./run_ppo_lag.sh
-#   ./run_ppo_lag.sh --use_comet --comet_project_name "ttct-training"
 
 set -e
 cd "$(dirname "$0")"
 
+# Comet ML: ключ по умолчанию (если не задан в окружении)
 export TL_LOADPATH=/usr/home/workspace/ttct/result/2026-02-26-15:33:39/model/checkpoint_latest.pt
+export COMET_API_KEY="${COMET_API_KEY:-3OfuYHwcRgIwG7DzgzJ190igY}"
+
 BATCH_SIZE="${BATCH_SIZE:-128}"
 
 if [ -z "$TL_LOADPATH" ]; then
@@ -20,6 +23,8 @@ if [ -z "$TL_LOADPATH" ]; then
 fi
 
 set -- \
+  --use_comet \
+  --comet_project_name "ttct-training" \
   --use_predict_cost \
   --use_credit_assignment \
   --lagrangian_multiplier_init 0.1 \

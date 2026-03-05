@@ -38,7 +38,7 @@ def single_agent_args():
     parser.add_argument("--use_eval", action="store_true", default=False)
     # Comet ML
     parser.add_argument("--use_comet", action="store_true", default=False, help="Enable Comet ML logging")
-    parser.add_argument("--comet_project_name", type=str, default="ttct-ppo-lag", help="Comet ML project name")
+    parser.add_argument("--comet_project_name", type=str, default="ttct-training", help="Comet ML project name")
     parser.add_argument("--comet_workspace", type=str, default=None, help="Comet ML workspace (optional)")
     # Device / misc
     parser.add_argument("--device", type=str, default="gpu")
