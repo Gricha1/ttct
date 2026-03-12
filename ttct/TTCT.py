@@ -181,7 +181,10 @@ class TTCT(nn.Module):
         last_obs=[]
         for obs in trajectory:
             last_obs.append(obs[-1])
-            padded_obs = np.pad(obs, ((0, max_length - len(obs)), (0, 0), (0, 0), (0, 0)), constant_values=0)
+            obs_arr = np.array(obs)
+            pad_len = max(0, max_length - len(obs))
+            pad_width = [(0, pad_len)] + [(0, 0)] * (obs_arr.ndim - 1)
+            padded_obs = np.pad(obs_arr, pad_width, constant_values=0)
             padded_obss.append(padded_obs)
         last_obs=torch.tensor(np.array(last_obs), dtype=torch.float32).to(self.device)
         last_obs=last_obs.view(batchsize,-1)

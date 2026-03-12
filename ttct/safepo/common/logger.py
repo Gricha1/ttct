@@ -346,9 +346,14 @@ class Logger:
             self._csv_writer.writerow(self.log_current_row.values())
             self.output_file.flush()
 
+        # Step for TB/Comet: env steps (if set) else epoch index
+        log_step = getattr(self, "env_step", None)
+        if log_step is None:
+            log_step = self.epoch
+
         if self.use_tensorboard:
             for key, val in self.log_current_row.items():
-                self.summary_writer.add_scalar(key, val, global_step=self.epoch)
+                self.summary_writer.add_scalar(key, val, global_step=log_step)
 
         # Log to Comet ML if enabled
         if getattr(self, "use_comet", False) and getattr(self, "comet_experiment", None) is not None:
@@ -359,13 +364,29 @@ class Logger:
                     if isinstance(v, (int, float)) or (hasattr(v, "__float__") and not isinstance(v, (str, dict, list)))
                 }
                 if metrics:
-                    self.comet_experiment.log_metrics(metrics, step=self.epoch)
+                    self.comet_experiment.log_metrics(metrics, step=log_step)
             except Exception:
                 pass
 
         # free logged information in all processes...
         self.log_current_row.clear()
         self.first_row = False
+
+    def log_video(self, file_path, step=None, name="eval_trajectory"):
+        """Log a video file to Comet ML if enabled."""
+        if not getattr(self, "use_comet", False) or getattr(self, "comet_experiment", None) is None:
+            return
+        try:
+            log_step = step if step is not None else getattr(self, "env_step", self.epoch)
+            # Comet API: file= path or file-like, name=, step=, format= for validation
+            if not os.path.isfile(file_path):
+                self.log("log_video: file not found %s" % file_path, color="red")
+                return
+            self.comet_experiment.log_video(
+                file=file_path, name=name, step=log_step, format="mp4"
+            )
+        except Exception as e:
+            self.log("Comet log_video failed: %s" % e, color="red")
 
 
 class EpochLogger(Logger):

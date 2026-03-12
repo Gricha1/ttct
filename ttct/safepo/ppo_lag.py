@@ -260,6 +260,8 @@ def main(args, cfg_env=None):
     total_steps = config.get("total_steps", args.total_steps)
     local_steps_per_epoch = steps_per_epoch // args.num_envs
     epochs = total_steps // steps_per_epoch
+    VALIDATION_INTERVAL_STEPS = 50_000
+    next_validation_at = VALIDATION_INTERVAL_STEPS
     # create the actor-critic module
     policy = ActorVCriticTrajectory(
         obs_dim=obs_dim,
@@ -509,6 +511,100 @@ def main(args, cfg_env=None):
                     with torch.no_grad():
                         obswithconstraint=TLmodel.test_encode(obslist,actlist,lengths,emb_mission)        
         rollout_end_time = time.time()
+        total_env_steps = (epoch + 1) * steps_per_epoch
+        # Validation every 50k env steps: run for each passed milestone (шаги не ровно 50k — проверяем все пороги)
+        comet_exp = getattr(logger, "comet_experiment", None)
+        while (args.task == "MiniGrid" and total_env_steps >= next_validation_at and comet_exp is not None):
+            validation_step = next_validation_at
+            next_validation_at += VALIDATION_INTERVAL_STEPS
+            try:
+                logger.log("Validation at step %d (total_env_steps=%d)..." % (validation_step, total_env_steps), color="cyan")
+                video_env = _wrap_minigrid('MiniGrid-HazardWorld-B-v0')()
+                reset_out = video_env.reset()
+                if isinstance(reset_out, (tuple, list)) and len(reset_out) >= 2:
+                    vid_obs, vid_info = reset_out[0], reset_out[1]
+                else:
+                    vid_obs, vid_info = reset_out, {}
+                vid_mission = [vid_info.get('mission', '') if isinstance(vid_info, dict) else '']
+                vid_obslist = [deepcopy(vid_obs)]
+                vid_actlist = [[-1]]
+                vid_lengths = [1]
+                with torch.no_grad():
+                    emb_m = TLmodel.test_encode_text(vid_mission)
+                    if args.is_finetune:
+                        finetune_m = EncodeModel.test_encode_text(vid_mission)
+                frames = []
+                vid_done = False
+                vid_rew, vid_cost, vid_len = 0.0, 0.0, 0
+                max_vid_steps = 500
+                while not vid_done and vid_len < max_vid_steps:
+                    if args.is_finetune:
+                        obsw = EncodeModel.test_encode(vid_obslist, vid_actlist, vid_lengths, finetune_m)
+                    else:
+                        obsw = TLmodel.test_encode(vid_obslist, vid_actlist, vid_lengths, emb_m)
+                    obsw = torch.as_tensor(obsw, dtype=torch.float32, device=device)
+                    if obsw.dim() == 1:
+                        obsw = obsw.unsqueeze(0)
+                    act, _, _, _ = policy.step(obsw, deterministic=True)
+                    action = act.detach().squeeze().cpu().numpy()
+                    if np.isscalar(action):
+                        action = np.array([action])
+                    out = video_env.step(int(action[0]) if action.size else 0)
+                    if len(out) == 5:
+                        next_obs, reward, term, trunc, info = out
+                        cost = info.get('cost', 0.0) if isinstance(info, dict) else 0.0
+                    else:
+                        next_obs, reward, cost, term, trunc, info = out
+                    vid_rew += float(reward)
+                    vid_cost += float(cost)
+                    vid_len += 1
+                    try:
+                        frame = video_env.render(mode='rgb_array')
+                        if frame is None:
+                            frame = video_env.render()
+                        if frame is not None:
+                            if not hasattr(frame, 'shape') and hasattr(frame, 'size'):
+                                frame = np.array(frame)
+                            if hasattr(frame, 'shape') and len(frame.shape) >= 2:
+                                frames.append(frame)
+                    except Exception:
+                        pass
+                    vid_done = term or trunc
+                    if not vid_done:
+                        vid_obslist[0].append(deepcopy(next_obs))
+                        vid_actlist[0].append(int(action[0]) if action.size else 0)
+                        vid_lengths[0] += 1
+                video_env.close()
+                if frames:
+                    import tempfile
+                    try:
+                        import imageio
+                        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as f:
+                            video_path = f.name
+                        # Ensure uint8 (H,W,C) for imageio
+                        frames_np = [np.asarray(f).astype(np.uint8) if f.dtype != np.uint8 else f for f in frames]
+                        imageio.mimsave(video_path, frames_np, fps=10, codec='libx264')
+                        logger.log_video(video_path, step=validation_step, name="eval_50k")
+                        try:
+                            os.unlink(video_path)
+                        except Exception:
+                            pass
+                        logger.log("Validation: video logged (%d frames) at step %d" % (len(frames), validation_step), color="green")
+                    except ImportError:
+                        logger.log("Validation: imageio not installed, skipping video (metrics still logged)", color="yellow")
+                    except Exception as e:
+                        logger.log("Validation: video save failed: %s" % e, color="red")
+                else:
+                    logger.log("Validation: no frames from render (video not recorded) at step %d" % validation_step, color="yellow")
+                comet_exp.log_metrics({
+                    "Validation/EpRet": vid_rew,
+                    "Validation/EpCost": vid_cost,
+                    "Validation/EpLen": vid_len,
+                }, step=validation_step)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                logger.log("Validation failed at step %d" % validation_step, color="red")
         eval_start_time = time.time()
         eval_episodes = 1 if epoch < epochs - 1 else 10
         if args.use_eval:
@@ -666,7 +762,7 @@ def main(args, cfg_env=None):
                 logger.log_tabular("Metrics/EvalEpCost")
                 logger.log_tabular("Metrics/EvalEpLen")
             logger.log_tabular("Train/Epoch", epoch + 1)
-            logger.log_tabular("Train/TotalSteps", (epoch + 1) * args.steps_per_epoch)
+            logger.log_tabular("Train/TotalSteps", (epoch + 1) * steps_per_epoch)
             logger.log_tabular("Train/StopIter", update_counts)
             # logger.log_tabular("Train/KL", final_kl)
             logger.log_tabular("Train/LagragianMultiplier", lagrange._lagrangian_multiplier)
@@ -682,6 +778,7 @@ def main(args, cfg_env=None):
             logger.log_tabular("Value/RewardAdv", data["adv_r"].mean().item())
             logger.log_tabular("Value/CostAdv", data["adv_c"].mean().item())
 
+            logger.env_step = (epoch + 1) * steps_per_epoch
             logger.dump_tabular()
             if (epoch+1) % 50 == 0 or epoch == 0:
                 logger.torch_save(itr=epoch)
