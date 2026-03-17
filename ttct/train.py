@@ -40,6 +40,7 @@ parser.add_argument('--dataset', type=str, default="./dataset/data.pkl")
 parser.add_argument('--use_comet', action='store_true', help='Использовать Comet ML для логирования')
 parser.add_argument('--comet_project_name', type=str, default='TTCT-Training', help='Имя проекта в Comet ML')
 parser.add_argument('--comet_workspace', type=str, default=None, help='Workspace в Comet ML (опционально)')
+parser.add_argument('--comet_experiment_name', type=str, default=None, help='Имя эксперимента в Comet ML (опционально)')
 
 args = parser.parse_args()
 
@@ -94,7 +95,10 @@ if __name__ == '__main__':
             hyperparams['gpu_memory_total_gb'] = torch.cuda.get_device_properties(0).total_memory / 1024**3
         
         comet_experiment.log_parameters(hyperparams)
-        comet_experiment.set_name(f"TTCT-{current_time}")
+        if args.comet_experiment_name:
+            comet_experiment.set_name(args.comet_experiment_name)
+        else:
+            comet_experiment.set_name(f"TTCT-{current_time}")
         print(f"📊 Comet ML: эксперимент '{comet_experiment.get_name()}' создан")
     
     # Очистка кэша GPU перед началом обучения
@@ -183,7 +187,15 @@ if __name__ == '__main__':
             if total_step % 10 == 0:
                 mask_cpu=mask.cpu()
                 logits_per_trajectory_cpu=logits_per_trajectory.cpu().detach()
-                roc_auc = roc_auc_score(mask_cpu.flatten(), logits_per_trajectory_cpu.flatten())
+                # roc_auc_score требует оба класса (0 и 1) в y_true
+                try:
+                    y_true = mask_cpu.flatten().numpy()
+                    if np.unique(y_true).size < 2:
+                        roc_auc = float("nan")
+                    else:
+                        roc_auc = roc_auc_score(y_true, logits_per_trajectory_cpu.flatten().numpy())
+                except Exception:
+                    roc_auc = float("nan")
                 avg_loss = curr_total_loss / 10
                 avg_TTA_loss = curr_TTA_loss/10
                 avg_CA_loss = curr_CA_loss/10
@@ -250,7 +262,14 @@ if __name__ == '__main__':
                 TTA_loss=(loss_trajectory(logits_per_trajectory,mask)+loss_text(logits_per_trajectory.t(),mask.t()))/2
                 mask_cpu=mask.cpu()
                 logits_per_trajectory_cpu=logits_per_trajectory.cpu().detach()
-                test_roc_auc+=roc_auc_score(mask_cpu.flatten(), logits_per_trajectory_cpu.flatten())
+                try:
+                    y_true = mask_cpu.flatten().numpy()
+                    if np.unique(y_true).size >= 2:
+                        test_roc_auc += roc_auc_score(y_true, logits_per_trajectory_cpu.flatten().numpy())
+                    else:
+                        test_roc_auc += 0.0  # один класс — AUC не определён
+                except Exception:
+                    test_roc_auc += 0.0
                 test_step+=1
                 test_loss += loss.item()
                 test_CA_loss+=CA_loss.item()
@@ -285,30 +304,22 @@ if __name__ == '__main__':
             except Exception as e:
                 logger.warning(f"Не удалось удалить предыдущий чекпоинт: {e}")
         
-        # Сохраняем текущий чекпоинт
+        # Сохраняем текущий чекпоинт (перезаписываем предыдущий)
         torch.save(model.state_dict(), checkpoint_path)
         logger.info(f'Чекпоинт сохранен: {checkpoint_path}')
-        
-        # Логирование чекпоинта в Comet ML
-        if comet_experiment:
-            comet_experiment.log_asset(checkpoint_path, file_name=f'checkpoint_epoch_{epoch+1}.pt')
-            logger.info(f'Comet ML: Чекпоинт эпохи {epoch+1} залогирован')
     
     writer.close()
     
-    # Сохраняем финальный чекпоинт с номером эпохи
+    # Финальный чекпоинт уже сохранен как checkpoint_latest.pt
     checkpoint_path = f'./result/{current_time}/model/checkpoint_latest.pt'
-    final_checkpoint_path = f'./result/{current_time}/model/checkpoint_epoch_{args.epochs}.pt'
-    if os.path.exists(checkpoint_path):
-        import shutil
-        shutil.copy2(checkpoint_path, final_checkpoint_path)
-        logger.info(f'Финальный чекпоинт сохранен: {final_checkpoint_path}')
     
-    # Завершение эксперимента в Comet ML
+    # Логируем финальный чекпоинт в Comet ML (только один раз в конце)
     if comet_experiment:
+        if os.path.exists(checkpoint_path):
+            comet_experiment.log_asset(checkpoint_path, file_name='checkpoint_latest.pt')
+            logger.info(f'Comet ML: Финальный чекпоинт залогирован')
         comet_experiment.end()
         print(f"✅ Comet ML: эксперимент завершен. URL: {comet_experiment.get_url()}")
     
     print(f"\n✅ Обучение завершено!")
-    print(f"📁 Последний чекпоинт: {checkpoint_path}")
-    print(f"📁 Финальный чекпоинт: {final_checkpoint_path}")
+    print(f"📁 Чекпоинт: {checkpoint_path}")

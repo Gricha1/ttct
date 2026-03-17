@@ -1,0 +1,10 @@
+name: dynalang
+channels:
+  - defaults
+dependencies:
+  # Минимальный env: conda env create не должен тянуть pip-зависимости JAX.
+  # Всё остальное ставится в Dockerfile (jax[cuda11_cudnn82], flax, optax, ...).
+  - python=3.8
+  - pip=23.3.1
+  - setuptools
+  - wheel
