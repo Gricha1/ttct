@@ -14,17 +14,26 @@
 # ==============================================================================
 
 from __future__ import annotations
+import os
+
+# Transformers (via TTCT) can import JAX before Craftax env inits; set platform before any of that loads.
+# Default: JAX on GPU. Set CRAFTEXT_JAX_CPU=1 to force CPU if PyTorch+JAX on one GPU misbehaves.
+_cjx = os.environ.get("CRAFTEXT_JAX_CPU", "0").strip().lower()
+if _cjx not in ("0", "false", "no", "off", "gpu", ""):
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    os.environ["JAX_PLATFORM_NAME"] = "cpu"
+
 from copy import deepcopy
 from tqdm import tqdm
 import datetime
 from torch.distributions import Categorical
-import os
 from torch.distributions import Normal
 import random
 import sys
 import time
 from collections import deque
 from TTCT import TTCT
+from craftext_pixel_encoder import CraftextPixelEncoder
 import gym.spaces
 import numpy as np
 import torch
@@ -42,7 +51,9 @@ from common.logger import EpochLogger, convert_json
 from common.model import ActorVCriticTrajectory
 from utils.config import single_agent_args, isaac_gym_map
 from utils.util import BufferDataset
-from utils.async_vector_env import AsyncVectorEnv, CostInInfoWrapper
+from utils.async_vector_env import AsyncVectorEnv, CostInInfoWrapper, IgnoreCostTerminationWrapper
+from utils.craftext_gym_env import CraftaxCMDPGymEnv
+from utils.simple_vector_env import SimpleVectorEnv
 import gym_minigrid
 import safety_gymnasium
 
@@ -76,6 +87,46 @@ isaac_gym_specific_cfg = {
     'use_critic_norm': False,
 }
 
+
+def _copy_rollout_obs(x):
+    """Avoid deepcopy on large pixel frames (63×63×3); keeps rollout Python overhead low."""
+    if isinstance(x, np.ndarray):
+        # np.asarray(..., copy=) requires NumPy 2+; np.array(..., copy=True) works on 1.x/2.x
+        return np.array(x, dtype=np.float32, copy=True)
+    return deepcopy(x)
+
+
+def _slice_for_ttct_encode(obslist, actlist, lengths, max_len: int):
+    """
+    Only the last max_len frames go into TTCT.test_encode (CNN+transformer scale with T).
+    Full obslist/actlist stay intact for buffer storage and get_cost.
+    max_len <= 0: no slicing (full history each encode).
+    """
+    if max_len <= 0:
+        return obslist, actlist, lengths
+    out_o, out_a, out_l = [], [], []
+    for i in range(len(obslist)):
+        lo = obslist[i]
+        la = actlist[i]
+        n = len(lo)
+        if n <= max_len:
+            out_o.append(lo)
+            out_a.append(la)
+            out_l.append(int(lengths[i]) if i < len(lengths) else n)
+        else:
+            out_o.append(lo[-max_len:])
+            out_a.append(la[-max_len:])
+            out_l.append(max_len)
+    return out_o, out_a, out_l
+
+
+def _buffer_histories(obslist, actlist):
+    """Light copies for buffer.store (was deepcopy of nested lists every env-step)."""
+    oo = [[_copy_rollout_obs(f) for f in traj[:-1]] for traj in obslist]
+    aa = [list(traj[:-1]) for traj in actlist]
+    return oo, aa
+
+
 def _set_module(model, submodule_key, module):
     tokens = submodule_key.split('.')
     sub_tokens = tokens[:-1]
@@ -106,7 +157,7 @@ def lora_model(model,rank):
             _set_module(model, submodule_key, lora_layer)
     
 
-def load_from_save(tlmodel,name):
+def load_from_save(tlmodel, name, strict: bool = True):
     model_path = name
     if not os.path.exists(model_path):
         raise FileNotFoundError(
@@ -115,7 +166,13 @@ def load_from_save(tlmodel,name):
         )
     with open(model_path, 'rb') as opened_file:
         state_dict = torch.load(opened_file, map_location="cpu")
-    tlmodel.load_state_dict(state_dict,strict=True)      
+    if strict:
+        tlmodel.load_state_dict(state_dict, strict=True)
+    else:
+        cur = tlmodel.state_dict()
+        matched = {k: v for k, v in state_dict.items() if k in cur and cur[k].shape == v.shape}
+        cur.update(matched)
+        tlmodel.load_state_dict(cur, strict=False)
     
 
 def main(args, cfg_env=None):
@@ -123,6 +180,11 @@ def main(args, cfg_env=None):
         act_dim=1
         obs_dim=147
         obs_emb_dim=64
+    elif args.task == "Craftax":
+        act_dim = 1
+        _ih, _iw = 63, 63
+        obs_dim = CraftextPixelEncoder.output_dim(_ih, _iw)
+        obs_emb_dim = obs_dim
     else:
         act_dim=2
         obs_dim=60
@@ -138,16 +200,35 @@ def main(args, cfg_env=None):
     transformer_layers=12
     BERT_PATH='./bert-base-uncased'
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        # Helps cuDNN pick algorithms; reduces sporadic "Unable to find a valid cuDNN algorithm" under some drivers/VRAM states.
+        torch.backends.cudnn.benchmark = True
+        if os.environ.get("TTCT_CUDNN_DETERMINISTIC", "").strip() in ("1", "true", "yes"):
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+        if os.environ.get("TTCT_DISABLE_CUDNN", "").strip() in ("1", "true", "yes"):
+            torch.backends.cudnn.enabled = False
     # set the random seed, device and number of threads
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
+    if device.type == "cuda" and os.environ.get("TTCT_ALLOW_TF32", "").strip() not in ("1", "true", "yes"):
+        # Avoid CUDNN_STATUS_INTERNAL_ERROR / bad heuristics on some GPU + driver + PyTorch builds (PyTorch suggests this for similar failures).
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    if device.type == "cuda" and torch.backends.cudnn.deterministic:
+        torch.backends.cudnn.benchmark = False
     torch.set_num_threads(4)
     use_predict_cost=args.use_predict_cost
     language_model= args.language_model
     if args.is_lava:
         config['threshold_Mini']=5.0
+    _ttct_pixel_kw = {}
+    _tl_load_strict = True
+    if args.task == "Craftax":
+        _ttct_pixel_kw = dict(use_pixel_encoder=True, image_hw=(63, 63))
+        _tl_load_strict = False
     if language_model=="TLmodel":
         TL_loadpath=args.TL_loadpath
         if args.is_finetune:
@@ -165,15 +246,19 @@ def main(args, cfg_env=None):
                     obs_emb_dim=obs_emb_dim,
                     obs_dim=obs_dim,
                     threshold=config['threshold_Mini'] if args.task == "MiniGrid" else config['threshold_Goal'],
-                    episodic_cost_value=config['cost_value']
+                    episodic_cost_value=config['cost_value'],
+                    **_ttct_pixel_kw,
                 )
             if args.use_pretrained_encoders:
-                load_from_save(EncodeModel,TL_loadpath)
-            EncodeModel=EncodeModel.to(device)
+                load_from_save(EncodeModel, TL_loadpath, strict=_tl_load_strict)
             if args.use_lora:
                 lora_model(EncodeModel,args.rank)
                 lora.mark_only_lora_as_trainable(EncodeModel)
-                EncodeModel=EncodeModel.to(device)
+            if args.task == "Craftax":
+                for _n, _p in EncodeModel.named_parameters():
+                    if _n.startswith("pixel_encoder.") or _n.startswith("embedding_act.") or _n.startswith("obs_encoder_linear."):
+                        _p.requires_grad = True
+            EncodeModel=EncodeModel.to(device)
         TLmodel=TTCT(
                     embed_dim=embed_dim,
                     trajectory_length=trajectory_length,
@@ -188,10 +273,11 @@ def main(args, cfg_env=None):
                     obs_emb_dim=obs_emb_dim,
                     obs_dim=obs_dim,
                     threshold=config['threshold_Mini'] if args.task == "MiniGrid" else config['threshold_Goal'],
-                    episodic_cost_value=config['cost_value']
+                    episodic_cost_value=config['cost_value'],
+                    **_ttct_pixel_kw,
                 )
         if args.use_pretrained_encoders:
-            load_from_save(TLmodel,TL_loadpath)
+            load_from_save(TLmodel, TL_loadpath, strict=_tl_load_strict)
         elif use_predict_cost:
             print(f"WARNING: --use-predict-cost is enabled but --use_pretrained_encoders is False.")
             print(f"         The TTCT model will use random weights, which may not work correctly.")
@@ -230,7 +316,10 @@ def main(args, cfg_env=None):
                 return gym.make(name)
 
         def _wrap_minigrid(name):
-            return CostInInfoWrapper(_make_minigrid(name))
+            env = _make_minigrid(name)
+            if getattr(args, "ignore_cost_termination", False):
+                env = IgnoreCostTerminationWrapper(env, cost_threshold=1.0)
+            return CostInInfoWrapper(env)
         envB=[lambda: _wrap_minigrid('MiniGrid-HazardWorld-B-v0') for _ in range(args.num_envs//3)]
         envS=[lambda: _wrap_minigrid('MiniGrid-HazardWorld-S-v0') for _ in range(args.num_envs//3)]
         envL=[lambda: _wrap_minigrid('MiniGrid-HazardWorld-L-v0') for _ in range(args.num_envs-(args.num_envs//3)*2)]
@@ -238,6 +327,20 @@ def main(args, cfg_env=None):
         if args.is_lava:
             allenv=[lambda: _wrap_minigrid('MiniGrid-HazardWorld-LavaWall-v0') for _ in range(args.num_envs)]
         env = AsyncVectorEnv(allenv)   
+    elif args.task == "Craftax":
+        # Use gym-style wrapper around Craftax CMDP env, returning 6-tuple step with cost.
+        # CostInInfoWrapper is not needed because our env already returns (obs, reward, cost, term, trunc, info).
+        def _make_craftax():
+            return CraftaxCMDPGymEnv(
+                env_name=getattr(args, "craftext_env_name", "Craftax-Classic-Pixels-v1-Text"),
+                craftext_settings=getattr(args, "craftext_settings", "achievements_safe_budget_energy"),
+                seed=int(args.seed),
+                max_episode_steps=199,
+                constraint_text=getattr(args, "constraint_text", "You must maintain your energy level at or above 8."),
+            )
+        allenv = [lambda: _make_craftax() for _ in range(args.num_envs)]
+        # Avoid multiprocessing for JAX Craftax envs (can crash in subprocess).
+        env = SimpleVectorEnv(allenv)
     elif args.task == "SafetyRacecarGoal2-v0":
         configB={"env_type":'budgetary','agent_name':'Racecar'}
         configR={"env_type":'relational','agent_name':'Racecar'}
@@ -267,9 +370,9 @@ def main(args, cfg_env=None):
         obs_dim=obs_dim,
         trajectory_dim=embed_dim,
         text_dim=embed_dim,
-        act_dim=act_space.n if args.task == "MiniGrid" else act_space.shape[0],
+        act_dim=act_space.n if args.task in ("MiniGrid", "Craftax") else act_space.shape[0],
         hidden_sizes=config["hidden_sizes"],
-        is_discrete=(args.task == "MiniGrid")
+        is_discrete=(args.task in ("MiniGrid", "Craftax"))
     ).to(device)
     actor_optimizer = torch.optim.Adam(policy.actor.parameters(), lr=config['learning_rate'])
     actor_scheduler = LinearLR(
@@ -304,6 +407,10 @@ def main(args, cfg_env=None):
         r_gamma=config["r_gamma"],
         c_gamma=config["c_gamma"],
     )
+    _raw_ttct_enc = os.environ.get(
+        "TTCT_PPO_ENCODE_MAXLEN", "64" if args.task == "Craftax" else "0"
+    ).strip()
+    _ttct_encode_maxlen = 0 if _raw_ttct_enc == "" else max(0, int(_raw_ttct_enc))
     # setup lagrangian multiplier
     lagrange = Lagrange(
         cost_limit=args.cost_limit,
@@ -322,6 +429,12 @@ def main(args, cfg_env=None):
             comet_project = getattr(args, "comet_project_name", "ttct_training")
             comet_workspace = getattr(args, "comet_workspace", None)
             comet_experiment = comet_ml.Experiment(project_name=comet_project, workspace=comet_workspace)
+            comet_name = getattr(args, "comet_experiment_name", None)
+            if comet_name:
+                try:
+                    comet_experiment.set_name(comet_name)
+                except Exception:
+                    pass
             params = dict(convert_json(dict_args))
             comet_experiment.log_parameters(params)
             if torch.cuda.is_available():
@@ -351,6 +464,12 @@ def main(args, cfg_env=None):
     if args.is_finetune:
         logger.setup_torch_saver1(EncodeModel)
     logger.log("Start with training.")
+    if args.task == "Craftax":
+        logger.log(
+            "Craftax rollout: TTCT_PPO_ENCODE_MAXLEN=%d (last T frames for policy TTCT encode; 0=full; set env to tune speed/quality)"
+            % _ttct_encode_maxlen,
+            color="cyan",
+        )
     actlist=[[] for i in range(args.num_envs)]
     obslist=[[] for i in range(args.num_envs)]
     truecostlist=[[] for i in range(args.num_envs)]
@@ -363,7 +482,7 @@ def main(args, cfg_env=None):
     else:
         raise ValueError("act_dim should be 1 or 2")
     mission=[]
-    if args.task == 'MiniGrid':
+    if args.task in ('MiniGrid', 'Craftax'):
         for idx in range(args.num_envs):
             mission.append(info[idx]['mission'])
     else:
@@ -375,16 +494,17 @@ def main(args, cfg_env=None):
         with torch.no_grad():
             finetune_mission=EncodeModel.test_encode_text(mission)
     for index,item in enumerate(obs):
-        obslist[index].append(deepcopy(item))
-        actlist[index].append(deepcopy(act))
+        obslist[index].append(_copy_rollout_obs(item))
+        actlist[index].append(act)
     lengths=[1 for i in range(args.num_envs)]
     # if use_predict_cost:
+    _o0, _a0, _l0 = _slice_for_ttct_encode(obslist, actlist, lengths, _ttct_encode_maxlen)
     if args.is_finetune:
         with torch.no_grad():
-            obswithconstraint=EncodeModel.test_encode(obslist,actlist,lengths,finetune_mission)
+            obswithconstraint=EncodeModel.test_encode(_o0,_a0,_l0,finetune_mission)
     else:
         with torch.no_grad():
-            obswithconstraint = TLmodel.test_encode(obslist,actlist,lengths,emb_mission)
+            obswithconstraint = TLmodel.test_encode(_o0,_a0,_l0,emb_mission)
     obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
     ep_ret,ep_cost_train,ep_cost_true, ep_len = (
         np.zeros(args.num_envs),
@@ -404,18 +524,19 @@ def main(args, cfg_env=None):
             next_obs, reward, true_cost, terminated, truncated, info = env.step(action)
             for idx, (done, time_out) in enumerate(zip(terminated, truncated)):
                 if done or time_out:
-                    if args.task== 'MiniGrid':
-                        final_obs=info[idx]["final_observation"]
+                    if args.task in ("MiniGrid", "Craftax"):
+                        final_obs = info[idx]["final_observation"]
                     else:
-                        final_obs=info["final_observation"][idx]
-                    obslist[idx].append(deepcopy(final_obs))
+                        final_obs = info["final_observation"][idx]
+                    obslist[idx].append(_copy_rollout_obs(final_obs))
                 else:
-                    obslist[idx].append(deepcopy(next_obs[idx]))
+                    obslist[idx].append(_copy_rollout_obs(next_obs[idx]))
                 actlist[idx].append(action[idx])
                 lengths[idx] += 1
+            _oe, _ae, _le = _slice_for_ttct_encode(obslist, actlist, lengths, _ttct_encode_maxlen)
             if args.is_finetune:
                 with torch.no_grad():
-                    next_obswithconstraint=EncodeModel.test_encode(obslist,actlist,lengths,finetune_mission)
+                    next_obswithconstraint=EncodeModel.test_encode(_oe,_ae,_le,finetune_mission)
             cost_train = true_cost
             ep_ret += reward.cpu().numpy() if args.task in isaac_gym_map.keys() else reward
             ep_cost_train += cost_train
@@ -425,13 +546,14 @@ def main(args, cfg_env=None):
                 torch.as_tensor(x, dtype=torch.float32, device=device)
                 for x in (next_obswithconstraint, reward, cost_train, terminated, truncated)
             )
+            _obs_buf, _act_buf = _buffer_histories(obslist, actlist)
             buffer.store(
                 obs=obswithconstraint,
                 act=torch.tensor(action),
-                obslist=deepcopy([item[0:-1] for item in obslist]),
-                actlist=deepcopy([item[0:-1] for item in actlist]),
+                obslist=_obs_buf,
+                actlist=_act_buf,
                 lengths=[item-1 for item in lengths],
-                mission=deepcopy(mission),
+                mission=list(mission),
                 reward=reward,
                 cost=cost_train,
                 value_r=value_r,
@@ -466,14 +588,14 @@ def main(args, cfg_env=None):
                             )
                     if done or time_out:
                         is_change=True
-                        if args.task== 'MiniGrid':
-                            mission[idx] = info[idx]['mission']
+                        if args.task in ("MiniGrid", "Craftax"):
+                            mission[idx] = info[idx]["mission"]
                         else:
-                            mission[idx] = info['mission'][idx]
+                            mission[idx] = info["mission"][idx]
                         lengths[idx] = 1
                         truecostlist[idx]=[0]
                         predictcostlist[idx]=[0]
-                        obslist[idx] = [deepcopy(obs[idx])]
+                        obslist[idx] = [_copy_rollout_obs(obs[idx])]
                         if act_dim==1:
                             act=-1
                         elif act_dim==2:
@@ -506,10 +628,12 @@ def main(args, cfg_env=None):
                 if args.is_finetune:
                     with torch.no_grad():
                         finetune_mission=EncodeModel.test_encode_text(mission)
-                        obswithconstraint=EncodeModel.test_encode(obslist,actlist,lengths,finetune_mission)
+                        _or, _ar, _lr = _slice_for_ttct_encode(obslist, actlist, lengths, _ttct_encode_maxlen)
+                        obswithconstraint=EncodeModel.test_encode(_or,_ar,_lr,finetune_mission)
                 else:
                     with torch.no_grad():
-                        obswithconstraint=TLmodel.test_encode(obslist,actlist,lengths,emb_mission)        
+                        _or, _ar, _lr = _slice_for_ttct_encode(obslist, actlist, lengths, _ttct_encode_maxlen)
+                        obswithconstraint=TLmodel.test_encode(_or,_ar,_lr,emb_mission)        
         rollout_end_time = time.time()
         total_env_steps = (epoch + 1) * steps_per_epoch
         # Validation every 50k env steps: run for each passed milestone (шаги не ровно 50k — проверяем все пороги)
@@ -686,7 +810,11 @@ def main(args, cfg_env=None):
                 if args.is_finetune and update_counts==0:
                     Encode_optimizer.zero_grad()
                     text_featrues=EncodeModel.test_encode_text(mission_b)
-                    obs_b=EncodeModel.test_encode(obslist_b,actlist_b,lengths_b,text_featrues)
+                    _obl = list(obslist_b)
+                    _abl = list(actlist_b)
+                    _lbl = list(lengths_b)
+                    _osl, _asl, _lsl = _slice_for_ttct_encode(_obl, _abl, _lbl, _ttct_encode_maxlen)
+                    obs_b=EncodeModel.test_encode(_osl, _asl, _lsl, text_featrues)
                 else:
                     obs_b=torch.cat([ele.unsqueeze(0) for ele in obs_b],dim=0).to(device)
                 reward_critic_optimizer.zero_grad()

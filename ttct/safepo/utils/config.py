@@ -15,6 +15,10 @@ def single_agent_args():
     parser.add_argument("--experiment", type=str, default="single_agent_exp")
     parser.add_argument("--is_lava", action="store_true")
     parser.add_argument("--num_envs", type=int, default=3, help="Fewer envs = less GPU memory (trajectory batch)")
+    # Craftax/CrafText (when --task Craftax)
+    parser.add_argument("--craftext_settings", type=str, default="achievements_safe_budget_energy")
+    parser.add_argument("--craftext_env_name", type=str, default="Craftax-Classic-Pixels-v1-Text")
+    parser.add_argument("--constraint_text", type=str, default="You must maintain your energy level at or above 8.")
     # Training
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps_per_epoch", type=int, default=16384)
@@ -23,6 +27,14 @@ def single_agent_args():
     parser.add_argument("--cost_limit", type=float, default=0.5)
     parser.add_argument("--lagrangian_multiplier_init", type=float, default=0.1)
     parser.add_argument("--lagrangian_multiplier_lr", type=float, default=0.035)
+    # MiniGrid HazardWorld: some tasks terminate the episode immediately when cost becomes 1.
+    # This switch allows continuing the episode after the first cost violation.
+    parser.add_argument(
+        "--ignore_cost_termination",
+        action="store_true",
+        default=False,
+        help="If set, override env terminated signal when cost==1 (MiniGrid HazardWorld).",
+    )
     # TTCT / cost
     parser.add_argument("--use_predict_cost", action="store_true", default=True)
     parser.add_argument("--use_credit_assignment", action="store_true", default=True)
@@ -40,6 +52,12 @@ def single_agent_args():
     parser.add_argument("--use_comet", action="store_true", default=False, help="Enable Comet ML logging")
     parser.add_argument("--comet_project_name", type=str, default="ttct-training", help="Comet ML project name")
     parser.add_argument("--comet_workspace", type=str, default=None, help="Comet ML workspace (optional)")
+    parser.add_argument(
+        "--comet_experiment_name",
+        type=str,
+        default="ppo lag minigrid",
+        help="Comet ML experiment name (optional).",
+    )
     # Device / misc
     parser.add_argument("--device", type=str, default="gpu")
     parser.add_argument("--device_id", type=int, default=0)

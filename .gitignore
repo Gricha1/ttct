@@ -1,3 +1,6 @@
+# Docker entrypoint stamp (requirements hash on host volume)
+.docker/
+
 # Python
 __pycache__/
 *.py[cod]

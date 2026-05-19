@@ -49,6 +49,16 @@ def _tl_key(item):
     return (item,)
 
 
+def align_obs_act(obs, act):
+    """Match obs_t with act_t (drop final-only obs when len(obs)==len(act)+1)."""
+    obs = np.asarray(obs, dtype=np.float32)
+    act = np.asarray(act, dtype=np.float32)
+    if len(obs) == len(act) + 1:
+        obs = obs[:-1]
+    n = max(min(len(obs), len(act)), 1)
+    return obs[:n], act[:n], n
+
+
 def gen_mask(batch_TLs):
     batch_sets = [{_tl_key(x) for x in sublist} for sublist in batch_TLs]
 
@@ -71,6 +81,16 @@ def gen_mask(batch_TLs):
 
     count = np.sum(matrix)
     return unique_TLs, matrix, count
+
+
+def gen_mask_from_nl(batch_nls):
+    """One column per unique NL; row i is one-hot. Use with forward(nl_texts=...) -> [B, U]."""
+    unique_nls = list(dict.fromkeys(batch_nls))
+    nl_to_j = {nl: j for j, nl in enumerate(unique_nls)}
+    matrix = np.zeros((len(batch_nls), len(unique_nls)), dtype=np.float32)
+    for i, nl in enumerate(batch_nls):
+        matrix[i, nl_to_j[nl]] = 1.0
+    return unique_nls, matrix, float(matrix.sum())
 
 
 class U3TDataset(Dataset):

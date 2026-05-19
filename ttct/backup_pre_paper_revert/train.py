@@ -4,7 +4,9 @@ from loguru import logger
 from torch import optim
 from utils import (
     MultiPositiveContrastiveLoss,
+    align_obs_act,
     gen_mask,
+    gen_mask_from_nl,
     KLLoss,
     split_dataset,
 )
@@ -260,12 +262,33 @@ def _tta_prepare_mask_and_forward(
     attention_masks: torch.Tensor,
     lengths,
     TLss,
+    NLss,
+    tta_text_mode: str,
     device: torch.device,
+    skip_inner_ce: bool = False,
 ):
-    _, mask, count = gen_mask(TLss)
-    logits, ca = model(
-        observations, acts, input_ids, attention_masks, lengths
-    )
+    fwd_kw = dict(skip_inner_ce=skip_inner_ce)
+    if tta_text_mode == "unique_nl":
+        _, mask, count = gen_mask_from_nl(NLss)
+        logits, ca = model(
+            observations,
+            acts,
+            input_ids,
+            attention_masks,
+            lengths,
+            nl_texts=NLss,
+            **fwd_kw,
+        )
+    else:
+        _, mask, count = gen_mask(TLss)
+        logits, ca = model(
+            observations,
+            acts,
+            input_ids,
+            attention_masks,
+            lengths,
+            **fwd_kw,
+        )
     mask_t = torch.tensor(mask, device=device, dtype=torch.float)
     return logits, ca, mask_t, count
 
@@ -276,61 +299,6 @@ def _compute_tta_loss(
     tta_traj = loss_traj(logits, mask)
     tta_text = loss_text(logits.t(), mask.t())
     return (tta_traj + tta_text) / 2, tta_traj, tta_text
-
-
-def build_ttct_optimizer(
-    model: TTCT,
-    learning_rate: float,
-    weight_decay: float,
-    transformer_lr_ratio: float = 0.1,
-):
-    """
-    Как debug_tta_overfit_one_batch: BERT frozen отдельно; transformer на lr*r;
-    остальные веса на learning_rate; logit_scale на lr*10.
-    transformer_lr_ratio=1.0 → один LR на все группы (кроме logit_scale).
-    """
-    tr_params, other_params = [], []
-    for name, param in model.named_parameters():
-        if not param.requires_grad or name == "logit_scale":
-            continue
-        if name.startswith("trajectory_transformer."):
-            tr_params.append(param)
-        else:
-            other_params.append(param)
-
-    ratio = float(transformer_lr_ratio)
-    if ratio <= 0.0:
-        ratio = 1.0
-    lr_tr = learning_rate * ratio
-    use_split = tr_params and ratio < 0.999
-
-    if use_split:
-        groups = [
-            {"params": tr_params, "lr": lr_tr},
-            {"params": other_params, "lr": learning_rate},
-            {"params": [model.logit_scale], "lr": learning_rate * 10.0},
-        ]
-        logger.info(
-            f"optimizer groups: transformer lr={lr_tr:g}, "
-            f"rest lr={learning_rate:g}, logit_scale lr={learning_rate * 10.0:g}"
-        )
-    else:
-        all_params = other_params + tr_params
-        groups = [
-            {"params": all_params, "lr": learning_rate},
-            {"params": [model.logit_scale], "lr": learning_rate * 10.0},
-        ]
-        logger.info(
-            f"optimizer groups: all lr={learning_rate:g}, "
-            f"logit_scale lr={learning_rate * 10.0:g}"
-        )
-
-    return optim.Adam(
-        groups,
-        betas=(0.9, 0.98),
-        eps=1e-8,
-        weight_decay=weight_decay,
-    )
 
 
 def _tta_batch_diagnostics(
@@ -529,13 +497,6 @@ parser.add_argument(
     help='Каждые N шагов: нормы градиентов TTA vs CA по группам (0=выкл). +2 backward/шаг.',
 )
 parser.add_argument(
-    '--dataloader_num_workers',
-    type=int,
-    default=-1,
-    help='DataLoader workers (-1: 0 if val_viz enabled else min(4, cpu)). '
-    'Use 0 if training hangs after val_viz (matplotlib + fork deadlock).',
-)
-parser.add_argument(
     '--no_freeze_bert',
     action='store_false',
     dest='freeze_bert',
@@ -543,15 +504,9 @@ parser.add_argument(
 )
 parser.set_defaults(freeze_bert=True)
 parser.add_argument(
-    '--transformer_lr_ratio',
-    type=float,
-    default=1.0,
-    help='LR множитель для trajectory_transformer (0.1 = lr/10 как в overfit; 1.0 = тот же lr).',
-)
-parser.add_argument(
     '--freeze_trajectory_transformer',
     action='store_true',
-    help='Не обучать trajectory_transformer (только encoders/projections).',
+    help='Не обучать trajectory_transformer (для debug / малых датасетов).',
 )
 parser.add_argument(
     '--tta_temperature',
@@ -560,11 +515,23 @@ parser.add_argument(
     help='Температура softmax для TTA (MultiPositiveContrastiveLoss).',
 )
 parser.add_argument(
+    '--tta_text_mode',
+    type=str,
+    default='inbatch',
+    choices=('inbatch', 'unique_nl'),
+    help='inbatch: B×B logits + TL mask; unique_nl: B×U logits, one-hot by NL (debug / few tasks)',
+)
+parser.add_argument(
+    '--tta_skip_inner_ce',
+    action='store_true',
+    help='Не добавлять trajectory_inner_loss в CA (полезно при ca_loss_weight=0).',
+)
+parser.add_argument(
     '--tta_loss',
     type=str,
-    default='kl',
+    default='soft_ce',
     choices=('soft_ce', 'kl'),
-    help='TTA: kl (paper MC loss) или soft_ce (mask target).',
+    help='TTA: soft_ce (mask target) или kl (KLLoss, как в оригинальном коде).',
 )
 
 args = parser.parse_args()
@@ -621,8 +588,9 @@ if __name__ == '__main__':
             'grad_norm_log_every': args.grad_norm_log_every,
             'freeze_bert': args.freeze_bert,
             'freeze_trajectory_transformer': args.freeze_trajectory_transformer,
-            'transformer_lr_ratio': args.transformer_lr_ratio,
             'tta_loss': args.tta_loss,
+            'tta_text_mode': args.tta_text_mode,
+            'tta_skip_inner_ce': args.tta_skip_inner_ce,
             'tta_temperature': args.tta_temperature,
             'dataset': args.dataset,
             'device': str(device),
@@ -687,13 +655,11 @@ if __name__ == '__main__':
         for param in model.text_model.parameters():
             param.requires_grad = False
         logger.info("BERT frozen (train text_projection + trajectory path)")
-    else:
-        bert_n = sum(p.numel() for p in model.text_model.parameters() if p.requires_grad)
-        logger.info(f"BERT trainable on CPU ({bert_n:,} params) + text_projection + trajectory path")
     if args.freeze_trajectory_transformer:
         for param in model.trajectory_transformer.parameters():
             param.requires_grad = False
         logger.info("trajectory_transformer frozen (forward only)")
+
     trainable_n = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Trainable parameters: {trainable_n:,}")
 
@@ -703,11 +669,12 @@ if __name__ == '__main__':
             f"try --batch_size 8..16 or set BATCH_SIZE in train_ttct_budget_energy.sh (default full-res is 12)."
         )
 
-    optimizer = build_ttct_optimizer(
-        model,
-        learning_rate=args.learning_rate,
+    optimizer = optim.Adam(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.learning_rate,
+        betas=(0.9, 0.98),
+        eps=1e-8,
         weight_decay=args.weight_decay,
-        transformer_lr_ratio=args.transformer_lr_ratio,
     )
     scheduler = None
     if args.lr_scheduler == "step":
@@ -736,9 +703,8 @@ if __name__ == '__main__':
     curr_CA_loss_weighted=0
     ca_loss_weight = float(args.ca_loss_weight)
     logger.info(
-        f'loss = TTA({args.tta_loss}, in-batch B×B) + {ca_loss_weight} * CA ; '
-        f'freeze_bert={args.freeze_bert}, freeze_traj_transformer={args.freeze_trajectory_transformer}, '
-        f'transformer_lr_ratio={args.transformer_lr_ratio}'
+        f'loss = TTA({args.tta_loss}, text={args.tta_text_mode}) + {ca_loss_weight} * CA ; '
+        f'freeze_bert={args.freeze_bert}, freeze_traj_transformer={args.freeze_trajectory_transformer}'
     )
     if args.grad_norm_log_every > 0:
         logger.info(
@@ -747,34 +713,11 @@ if __name__ == '__main__':
 
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
 
-    trainset, testset = split_dataset(args.dataset)
-    viz_enabled = args.val_viz_every_epochs > 0 or args.val_viz_every_steps > 0
-    if args.dataloader_num_workers >= 0:
-        num_workers = args.dataloader_num_workers
-    elif viz_enabled:
-        num_workers = 0
-    else:
-        num_workers = min(4, os.cpu_count() or 1)
-    logger.info(
-        f"DataLoader num_workers={num_workers} "
-        f"(train={len(trainset)}, test={len(testset)}, viz_enabled={viz_enabled})"
-    )
-    dataloader_train = torch.utils.data.DataLoader(
-        trainset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=lambda x: x,
-        persistent_workers=False,
-    )
-    dataloader_test = torch.utils.data.DataLoader(
-        testset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=lambda x: x,
-        persistent_workers=False,
-    )
+    trainset,testset=split_dataset(args.dataset)
+    # Уменьшаем num_workers для экономии памяти
+    num_workers = min(4, os.cpu_count() or 1)  # Ограничиваем количество воркеров
+    dataloader_train=torch.utils.data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers,collate_fn=lambda x:x)
+    dataloader_test=torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers,collate_fn=lambda x:x)
 
     steps_per_epoch = max(1, len(dataloader_train))
     viz_dir = f'./result/{current_time}/val_viz'
@@ -864,16 +807,17 @@ if __name__ == '__main__':
             padded_obss = []
             padded_acts = []
             for obs, act in zip(obss, acts_raw):
-                lengths_list.append(len(obs))
+                obs_a, act_a, n = align_obs_act(obs, act)
+                lengths_list.append(n)
                 padded_obss.append(
                     np.pad(
-                        obs,
-                        ((0, trajectory_length - len(obs)), (0, 0), (0, 0), (0, 0)),
+                        obs_a,
+                        ((0, trajectory_length - n), (0, 0), (0, 0), (0, 0)),
                         constant_values=0,
                     )
                 )
                 padded_acts.append(
-                    np.pad(act, (0, trajectory_length - len(act)), constant_values=0)
+                    np.pad(act_a, (0, trajectory_length - n), constant_values=0)
                 )
             lengths = np.array(lengths_list, dtype=np.int32)
             padded_obss = torch.tensor(np.array(padded_obss), dtype=torch.float32).to(device, non_blocking=True)
@@ -898,7 +842,10 @@ if __name__ == '__main__':
                 attention_masks,
                 lengths,
                 TLss,
+                NLss,
+                args.tta_text_mode,
                 device,
+                skip_inner_ce=args.tta_skip_inner_ce,
             )
             CA_loss_weighted = CA_loss_raw * ca_loss_weight
             TTA_loss, TTA_loss_traj, TTA_loss_text = _compute_tta_loss(
@@ -1114,14 +1061,7 @@ if __name__ == '__main__':
                         tag_prefix=f"step{total_step:06d}",
                         step_for_log=total_step,
                     )
-                logger.info(
-                    f"Step {total_step}: val_viz done, continuing train (epoch {epoch})"
-                )
-
-        logger.info(
-            f"Epoch {epoch}: train loop done ({total_step} steps so far), "
-            f"running test on {len(testset)} samples ({len(dataloader_test)} batches)..."
-        )
+            
         with torch.no_grad():
             model.eval()
             test_loss = 0.0
@@ -1144,16 +1084,17 @@ if __name__ == '__main__':
                 padded_obss = []
                 padded_acts = []
                 for obs, act in zip(obss, acts_raw):
-                    lengths_list.append(len(obs))
+                    obs_a, act_a, n = align_obs_act(obs, act)
+                    lengths_list.append(n)
                     padded_obss.append(
                         np.pad(
-                            obs,
-                            ((0, trajectory_length - len(obs)), (0, 0), (0, 0), (0, 0)),
+                            obs_a,
+                            ((0, trajectory_length - n), (0, 0), (0, 0), (0, 0)),
                             constant_values=0,
                         )
                     )
                     padded_acts.append(
-                        np.pad(act, (0, trajectory_length - len(act)), constant_values=0)
+                        np.pad(act_a, (0, trajectory_length - n), constant_values=0)
                     )
                 lengths = np.array(lengths_list, dtype=np.int32)
                 padded_obss = torch.tensor(np.array(padded_obss), dtype=torch.float32).to(device, non_blocking=True)
@@ -1177,7 +1118,10 @@ if __name__ == '__main__':
                     attention_masks,
                     lengths,
                     TLss,
+                    NLss,
+                    args.tta_text_mode,
                     device,
+                    skip_inner_ce=args.tta_skip_inner_ce,
                 )
                 CA_loss_weighted = CA_loss_raw * ca_loss_weight
                 TTA_loss, _, _ = _compute_tta_loss(
@@ -1267,22 +1211,16 @@ if __name__ == '__main__':
                     )
                 logger.info(f'Comet ML: Эпоха {epoch} залогирована')
 
-            logger.info(
-                f"Epoch {epoch}: test done ({test_step} batches), loss={test_loss / max(test_step, 1):.4f}"
-            )
-
             if args.val_viz_every_epochs > 0 and (
                 epoch % args.val_viz_every_epochs == 0 or epoch == args.epochs - 1
             ):
-                logger.info(f"Epoch {epoch}: epoch-end val_viz on testset...")
                 _run_val_viz(
                     testset,
                     epoch,
                     tag_prefix=f"epoch{epoch:03d}",
                     step_for_log=total_step,
                 )
-                logger.info(f"Epoch {epoch}: epoch-end val_viz done")
-
+        
         if scheduler is not None:
             scheduler.step()
         lr_now = optimizer.param_groups[0]["lr"]

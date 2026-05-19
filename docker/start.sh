@@ -17,8 +17,14 @@ else
 fi
 
 echo "start dockergpu device: $device"
-echo "start docker name: hrac_$docker_container_idx"
+echo "start docker name: ttct_$docker_container_idx"
 echo "start docker image: $image_name"
+echo "workspace mount: $(cd .. && pwd) -> /usr/home/workspace"
 
 cd ..
-docker run -it --rm --name ttct_$docker_container_idx --gpus "device=$device" --runtime=nvidia -e NVIDIA_DRIVER_CAPABILITIES=compute,utility -v $(pwd):/usr/home/workspace $image_name "bash"
+# Host repo is the source of truth; entrypoint runs install_deps when requirements change.
+docker run -it --rm --name ttct_$docker_container_idx \
+  --gpus "device=$device" --runtime=nvidia \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+  -v "$(pwd)":/usr/home/workspace \
+  "$image_name" bash

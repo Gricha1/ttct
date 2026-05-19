@@ -1,0 +1,27 @@
+# Исключить из контекста Docker (избегаем "can't stat" и уменьшаем контекст)
+# Если всё равно ошибка "can't stat .../.tmp" — выполните: sudo rm -rf ttct/.tmp
+.git
+.gitignore
+*.tmp
+.tmp
+ttct/.tmp
+**/.tmp
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.coverage
+htmlcov
+.idea
+.vscode
+*.egg-info
+*.egg
+dist
+build
+result
+results
+*.tfevents.*
+*.log
+.comet.config
+.ipynb_checkpoints
+.DS_Store

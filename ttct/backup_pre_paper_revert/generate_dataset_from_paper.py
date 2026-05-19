@@ -643,66 +643,6 @@ def generate_debug_minigrid_constraints():
     ]
 
 
-def generate_debug_minigrid_constraints_l2():
-    """
-    Уровень 2: 10 разнообразных ограничений (lava/grass/water + одно sequential).
-    """
-    return _dedupe_constraints(
-        [
-            _constraint_record(
-                "quantitative",
-                "Do not cross lava more than 3 times.",
-                {"entity": "lava", "op": "more_than", "n": 3},
-            ),
-            _constraint_record(
-                "quantitative",
-                "Do not cross lava more than 5 times.",
-                {"entity": "lava", "op": "more_than", "n": 5},
-            ),
-            _constraint_record(
-                "quantitative",
-                "Do not cross lava more than 8 times.",
-                {"entity": "lava", "op": "more_than", "n": 8},
-            ),
-            _constraint_record(
-                "quantitative",
-                "Never reach grass more than 3 times.",
-                {"entity": "grass", "op": "more_than", "n": 3},
-            ),
-            _constraint_record(
-                "quantitative",
-                "Never reach grass more than 5 times.",
-                {"entity": "grass", "op": "more_than", "n": 5},
-            ),
-            _constraint_record(
-                "quantitative",
-                "Never reach grass more than 8 times.",
-                {"entity": "grass", "op": "more_than", "n": 8},
-            ),
-            _constraint_record(
-                "quantitative",
-                "Please touch water less than 2 times.",
-                {"entity": "water", "op": "less_than", "n": 2},
-            ),
-            _constraint_record(
-                "quantitative",
-                "Please touch water less than 5 times.",
-                {"entity": "water", "op": "less_than", "n": 5},
-            ),
-            _constraint_record(
-                "quantitative",
-                "Don't touch lava more than 10 times!",
-                {"entity": "lava", "op": "more_than", "n": 10},
-            ),
-            _constraint_record(
-                "sequential",
-                "After you touch water, don't step on lava!",
-                {"first": "water", "second": "lava"},
-            ),
-        ]
-    )
-
-
 def generate_all_possible_constraints(pool: str = "paper_full"):
     """
     Пул текстовых ограничений для разметки траекторий.
@@ -711,18 +651,11 @@ def generate_all_possible_constraints(pool: str = "paper_full"):
       - paper_full (~200+, Table 2 + HazardWorld phrasing)
       - legacy_30 (старый короткий список)
       - debug_2 (2 задачи для отладки обучения)
-      - debug_10 (10 задач, 1 NL на траекторию — debug2)
-      - debug_10_all (те же 10 текстов, все пары traj×constraint — debug3)
-      - full_fix (paper_full ~217 текстов, 1 случайное NL на traj — без дублей traj в батче)
     """
     if pool == "debug_2":
         return generate_debug_minigrid_constraints()
-    if pool in ("debug_10", "debug_10_all"):
-        return generate_debug_minigrid_constraints_l2()
     if pool == "legacy_30":
         return _generate_legacy_30_constraints()
-    if pool == "full_fix":
-        pool = "paper_full"
     constraints = []
     constraints.extend(_generate_budgetary_constraints())
     constraints.extend(_generate_sequential_constraints())
@@ -836,26 +769,11 @@ def create_dataset_pairs(
     print("Создание пар (trajectory, constraint) с проверкой нарушений...")
     print("  Это может занять некоторое время...")
     
-    pool_for_constraints = constraint_pool
-    if constraint_pool == "full_fix":
-        pool_for_constraints = "paper_full"
-    all_constraints = generate_all_possible_constraints(pool=pool_for_constraints)
-    if max_constraints_per_trajectory is None and constraint_pool in (
-        "debug_2",
-        "debug_10",
-        "full_fix",
-    ):
+    all_constraints = generate_all_possible_constraints(pool=constraint_pool)
+    if max_constraints_per_trajectory is None and constraint_pool == "debug_2":
         max_constraints_per_trajectory = 1
     if max_constraints_per_trajectory == 1:
-        if constraint_pool == "full_fix":
-            print(
-                "  Режим full_fix: paper_full pool, 1 случайное NL на траекторию "
-                "(~{} текстов в пуле)".format(len(all_constraints))
-            )
-        else:
-            print("  Режим debug: 1 случайное NL-ограничение на траекторию")
-    elif constraint_pool == "debug_10_all":
-        print("  Режим debug3: все 10 ограничений на каждую траекторию (как paper_full)")
+        print("  Режим debug: 1 случайное NL-ограничение на траекторию (без дублей traj×2 в батче)")
     print(f"  Пул ограничений: {constraint_pool!r}, уникальных текстов: {len(all_constraints)}")
     by_type = defaultdict(int)
     for c in all_constraints:
@@ -1022,8 +940,8 @@ if __name__ == "__main__":
         "--constraint_pool",
         type=str,
         default="paper_full",
-        choices=("paper_full", "legacy_30", "debug_2", "debug_10", "debug_10_all", "full_fix"),
-        help="paper_full | full_fix | legacy_30 | debug_2 | debug_10 | debug_10_all",
+        choices=("paper_full", "legacy_30", "debug_2"),
+        help="paper_full | legacy_30 | debug_2 (2 задачи для отладки TTCT)",
     )
 
     args = parser.parse_args()

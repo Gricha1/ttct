@@ -58,7 +58,10 @@ class TTCT(nn.Module):
             self.obs_encoder_linear = nn.Linear(cnn_out, transformer_width - 16)
         else:
             self.pixel_encoder = None
-            self.obs_encoder = nn.Linear(obs_dim, obs_emb_dim)
+            self.obs_encoder = nn.Sequential(
+                nn.Linear(obs_dim, obs_emb_dim),
+                nn.ReLU(),
+            )
             self.obs_encoder_linear = nn.Linear(obs_emb_dim, transformer_width - 16)
         self.trajectory_inner_loss=nn.CrossEntropyLoss()
         self.trajectory_transformer = Transformer(
@@ -90,6 +93,7 @@ class TTCT(nn.Module):
         self.trajectory_positional_embedding = nn.Parameter(torch.empty(self.trajectory_length, transformer_width))
         self.ln_final = LayerNorm(transformer_width)
         self.trajectory_ln_final=LayerNorm(transformer_width)
+        self.traj_input_ln = LayerNorm(transformer_width)
         self.text_projection = nn.Parameter(torch.empty(768, embed_dim))
         self.trajectory_projection=nn.Parameter(torch.empty(transformer_width,embed_dim))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
@@ -106,7 +110,7 @@ class TTCT(nn.Module):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
         elif self.obs_encoder is not None:
-            nn.init.normal_(self.obs_encoder.weight, std=0.02)
+            nn.init.normal_(self.obs_encoder[0].weight, std=0.02)
         nn.init.normal_(self.trajectory_positional_embedding, std=0.01)
         nn.init.orthogonal_(self.cost_assignment_layer[0].weight)
         nn.init.orthogonal_(self.cost_assignment_layer[2].weight)
@@ -164,9 +168,47 @@ class TTCT(nn.Module):
         x = torch.cat([trajector, text.unsqueeze(0).repeat(trajector.shape[-2],1)], dim=-1)
         return self.cost_assignment_layer(x)
     
-    def encode_trajectory(self, trajectory, lengths, text_featrues):
-        """Paper §4.1: HT at last valid step; CA uses per-step text-conditioned attention."""
-        x = trajectory
+    def _mask_trajectory_padding(self, trajectory: torch.Tensor, lengths) -> torch.Tensor:
+        """Zero padded timesteps so transformer is not fed 200 steps of zeros."""
+        out = trajectory.clone()
+        for i in range(out.size(0)):
+            L = int(lengths[i])
+            if L < out.size(1):
+                out[i, L:, :] = 0
+        return out
+
+    def _trajectory_embed_last_step(
+        self, x: torch.Tensor, lengths
+    ) -> torch.Tensor:
+        """Paper §4.1: HT — embedding at last valid timestep (index length-1)."""
+        rows = []
+        for i in range(x.size(0)):
+            L = max(int(lengths[i]), 1)
+            L = min(L, x.size(1))
+            rows.append(x[i, L - 1, :])
+        return torch.stack(rows)
+
+    def _tta_score_matrix(
+        self,
+        x: torch.Tensor,
+        text_columns: torch.Tensor,
+        lengths,
+    ) -> torch.Tensor:
+        """logits[b, c] = scale * dot(HT_b, text_c); HT from last step after projection."""
+        logit_scale = self.logit_scale.exp().clamp(min=1e-3, max=10.0)
+        ht = _safe_unit_normalize(self._trajectory_embed_last_step(x, lengths), dim=-1)
+        return logit_scale * (ht @ text_columns.t())
+
+    def encode_trajectory(
+        self,
+        trajectory,
+        lengths,
+        text_featrues,
+        skip_inner_ce: bool = False,
+    ):
+        """Returns per-step embeddings [B,T,D] and CA loss (normalize per step for CA only)."""
+        x = self.traj_input_ln(trajectory)
+        x = self._mask_trajectory_padding(x, lengths)
         x = x + self.trajectory_positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.trajectory_transformer(x)
@@ -195,17 +237,14 @@ class TTCT(nn.Module):
                 + self.error(episodic_cost[i][0], sum_cost)
             ) / 2
         cost_assignment_loss = cost_assignment_loss / hidden_embed.size(0)
-        cost_assignment_loss += self.trajectory_inner_loss(
-            cos_sim,
-            torch.tensor([max(int(item) - 1, 0) for item in lengths]).to(self.device),
-        )
-        last_embed = torch.stack(
-            [
-                x_norm[i, max(min(int(lengths[i]), x_norm.size(1)), 1) - 1, :]
-                for i in range(x_norm.size(0))
-            ]
-        )
-        return last_embed, cost_assignment_loss
+        if not skip_inner_ce:
+            cost_assignment_loss += self.trajectory_inner_loss(
+                cos_sim,
+                torch.tensor([max(int(item) - 1, 0) for item in lengths]).to(
+                    self.device
+                ),
+            )
+        return x_norm, cost_assignment_loss
     
     def test_encode_text(self,text):
         input_ids = []
@@ -388,8 +427,18 @@ class TTCT(nn.Module):
         input_ids,
         attention_mask,
         lengths,
+        nl_texts: Optional[List[str]] = None,
+        skip_inner_ce: bool = False,
     ):
         batch_size=observations.shape[0]
+        actions = actions.clone()
+        for i in range(batch_size):
+            L = int(lengths[i])
+            if L < self.trajectory_length:
+                if actions.ndim == 3:
+                    actions[i, L:, :] = 0
+                else:
+                    actions[i, L:] = 0
         if actions.ndim == 2:
             actions = actions.unsqueeze(-1)
         actions = actions.view(batch_size * self.trajectory_length, -1)
@@ -413,11 +462,27 @@ class TTCT(nn.Module):
         # normalized features
         text_features = _safe_unit_normalize(text_features, dim=-1)
         
-        trajectory_features, cost_assignment_loss = self.encode_trajectory(
-            trajectory_features, lengths, text_features
+        traj_steps, cost_assignment_loss = self.encode_trajectory(
+            trajectory_features,
+            lengths,
+            text_features,
+            skip_inner_ce=skip_inner_ce,
         )
-        logit_scale = self.logit_scale.exp().clamp(min=1e-3, max=10.0)
-        logits_per_trajectory = logit_scale * trajectory_features @ text_features.t()
+
+        if nl_texts is not None:
+            first_idx = []
+            seen = set()
+            for i, nl in enumerate(nl_texts):
+                if nl not in seen:
+                    seen.add(nl)
+                    first_idx.append(i)
+            text_for_tta = text_features[first_idx]
+        else:
+            text_for_tta = text_features
+        logits_per_trajectory = self._tta_score_matrix(
+            traj_steps, text_for_tta, lengths
+        )
+        # Do not hard-clamp logits here: saturating at ±50 makes softmax ~uniform (TTA stuck at ln B).
         logits_per_trajectory = torch.nan_to_num(
             logits_per_trajectory, nan=0.0, posinf=1e4, neginf=-1e4
         )

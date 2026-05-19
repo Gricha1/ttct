@@ -57,19 +57,25 @@ RUN pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 --extra-index-url 
 RUN pip install pygame --no-deps
 RUN pip install seaborn
 
-# Extra deps needed by ttct repo scripts
-RUN pip install loguru num2words transformers tensorboardX loralib safepo safety_gymnasium comet_ml moviepy opencv-python imageio imageio-ffmpeg
+# MiniGrid: gym 0.15 + forked gym_minigrid (HazardWorld) from editable ttct — do not pip-install gym_minigrid (1.2.x needs gym>=0.26)
+RUN pip install loguru num2words transformers tensorboardX loralib safepo safety_gymnasium comet_ml moviepy opencv-python imageio imageio-ffmpeg gym==0.15.7
 
-# Install Craftax, workspace packages on shell startup
+# Project code (ttct, caged_craftext) is NOT baked in — mount host dir to /usr/home/workspace at run time.
+COPY docker/entrypoint.sh /opt/docker-entrypoint.sh
+COPY docker/sync_workspace.sh /opt/sync_workspace.sh
+RUN chmod +x /opt/docker-entrypoint.sh /opt/sync_workspace.sh
+
+ENV WORKSPACE=/usr/home/workspace
+ENV WORKSPACE_ROOT=/usr/home/workspace
+
 SHELL ["/bin/bash", "--login", "-c"]
 RUN echo ". /opt/conda/etc/profile.d/conda.sh" >> ~/.bashrc && \
-    echo "conda activate dynalang" >> ~/.bashrc
-RUN echo "cd /usr/home/workspace/Craftax && pip install -e . --no-deps" >> ~/.bashrc
-RUN echo "cd /usr/home/workspace/ttct && pip install -e . --no-deps" >> ~/.bashrc
-RUN echo "cd /usr/home/workspace/ && pip install -e . --no-deps" >> ~/.bashrc
+    echo "conda activate dynalang" >> ~/.bashrc && \
+    echo "cd /usr/home/workspace" >> ~/.bashrc && \
+    echo "git config --global --add safe.directory /usr/home/workspace" >> ~/.bashrc
 
-# Setup github (avoid safe.directory errors when mounted)
-RUN echo "git config --global --add safe.directory /usr/home/workspace" >> ~/.bashrc
+ENTRYPOINT ["/opt/docker-entrypoint.sh"]
+CMD ["bash"]
 
 RUN pip install plotly
 RUN pip install --upgrade kaleido

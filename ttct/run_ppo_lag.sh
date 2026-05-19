@@ -25,8 +25,10 @@ fi
 set -- \
   --use_comet \
   --comet_project_name "ttct-training" \
+  --comet_experiment_name "ppo lag minigrid" \
   --use_predict_cost \
   --use_credit_assignment \
+  --ignore_cost_termination \
   --lagrangian_multiplier_init 0.1 \
   --batch_size "$BATCH_SIZE" \
   --is_finetune \

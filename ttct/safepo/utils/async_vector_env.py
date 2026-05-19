@@ -13,7 +13,7 @@ from gym.vector.utils import (create_shared_memory, create_empty_array,
                               write_to_shared_memory, read_from_shared_memory,
                               concatenate, CloudpickleWrapper, clear_mpi_env_vars)
 
-__all__ = ['AsyncVectorEnv', 'CostInInfoWrapper']
+__all__ = ['AsyncVectorEnv', 'CostInInfoWrapper', 'IgnoreCostTerminationWrapper']
 
 
 class CostInInfoWrapper:
@@ -40,6 +40,50 @@ class CostInInfoWrapper:
 
     def close(self):
         return self.env.close()
+
+
+class IgnoreCostTerminationWrapper:
+    """
+    For some envs (e.g. MiniGrid HazardWorld), `terminated` is set to True when `cost==1`.
+    This wrapper keeps the step signal going by forcing `terminated=False` on cost violations.
+
+    It preserves the original step tuple structure (6-element Gym-like output from the inner env).
+    """
+
+    def __init__(self, env, cost_threshold: float = 1.0):
+        self.env = env
+        self.cost_threshold = cost_threshold
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+    def _is_cost_violation(self, cost) -> bool:
+        try:
+            cost_val = float(cost)
+        except Exception:
+            cost_val = float(np.asarray(cost).item())
+        return cost_val >= float(self.cost_threshold)
+
+    def step(self, action):
+        out = self.env.step(action)
+        if len(out) == 6:
+            obs, reward, cost, term, trunc, info = out
+            if bool(term) and self._is_cost_violation(cost):
+                term = False
+            return (obs, reward, cost, term, trunc, info)
+
+        # Fallback: some envs may already pack cost into info (we keep structure intact).
+        if len(out) == 5:
+            obs, reward, term, trunc, info = out
+            info = dict(info) if info is not None else {}
+            if bool(term) and ('cost' in info) and self._is_cost_violation(info['cost']):
+                term = False
+            return (obs, reward, term, trunc, info)
+
+        return out
 
 
 def _safe_concatenate(observations_list, out, single_observation_space):
